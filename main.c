@@ -141,6 +141,7 @@
  *       conceitos utilizados em firmware, hardware e sistemas embarcados.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <stdbool.h>
@@ -180,6 +181,8 @@
 
 static TaskHandle_t taskBotaoHandle = NULL;
 static TaskHandle_t taskControleHandle = NULL;
+static TaskHandle_t taskTelemetriaHandle = NULL;
+
 
 
 typedef struct{
@@ -187,7 +190,6 @@ typedef struct{
   adc_oneshot_unit_handle_t adc_handle;
   QueueHandle_t fila;
 } sensor_task_context_t;
-
 
 typedef struct {
   int16_t temperatura_raw;
@@ -209,6 +211,16 @@ typedef enum {
     STATE_CRITICAL
 } system_state_t;
 
+typedef struct {
+    QueueHandle_t fila_sensores;
+    QueueHandle_t fila_telemetria;
+} control_task_context_t;
+
+typedef struct{
+  sensor_data_t dados;
+  system_state_t estado;
+  bool alarme_reconhecido;
+} telemetry_data_t;
 
 
   esp_err_t ler_temperatura_raw(
@@ -323,11 +335,11 @@ typedef enum {
 
 
       resultado = ler_aceleracao_raw(
-        ctx->mpu_handle, 
-        &leitura.ax, 
-        &leitura.ay, 
-        &leitura.az
-        );
+                                      ctx->mpu_handle, 
+                                      &leitura.ax, 
+                                      &leitura.ay, 
+                                      &leitura.az
+                                      );
 
         if(resultado != ESP_OK){
 
@@ -375,9 +387,9 @@ typedef enum {
         }
 
         xQueueSend(
-          ctx->fila,
-          &leitura,
-          portMAX_DELAY
+          ctx->fila,   //Onde enviar (Handle da Fila)
+          &leitura,    //O que enviar (Ponteiro para o Dado)
+          pdMS_TO_TICKS(100)
         );
 
 
@@ -411,24 +423,32 @@ typedef enum {
 
   void taskControle(void *pvParameters){
 
-    QueueHandle_t fila = (QueueHandle_t)pvParameters;
+    control_task_context_t *ctx = (control_task_context_t *)pvParameters;
 
-    sensor_data_t leitura;
-
+    sensor_data_t leitura = {0};
+    telemetry_data_t telemetria = {0};
     bool alarme_reconhecido = false;
 
 
     while(true){
 
-      xQueueReceive(
-        fila,
-        &leitura,
-        portMAX_DELAY
-      );
+      BaseType_t recebeu = xQueueReceive(
+                                          ctx->fila_sensores,
+                                          &leitura,
+                                          pdMS_TO_TICKS(100)
+                                        );
+
+      if(recebeu != pdTRUE){
+        continue; //tratar depois
+      }
+
+      telemetria.dados = leitura;
 
       system_state_t estado = avaliar_estado(&leitura);
+      
+      telemetria.estado = estado;
 
-      atualiza_leds(estado); 
+        atualiza_leds(estado); 
 
       if (estado != STATE_CRITICAL) {
           alarme_reconhecido = false;
@@ -441,6 +461,12 @@ typedef enum {
     
       if(aviso > 0 && estado == STATE_CRITICAL){
         alarme_reconhecido = true;
+      }
+
+      telemetria.alarme_reconhecido = alarme_reconhecido;
+
+      if (xQueueSend(ctx->fila_telemetria, &telemetria, 0) != pdTRUE) {
+          printf("Fila de telemetria cheia: mensagem descartada\n");
       }
 
       if (estado == STATE_CRITICAL && !alarme_reconhecido) {
@@ -488,6 +514,27 @@ typedef enum {
         }
       }    
     }
+  }
+
+  void taskTelemetria(void *pvParameters){
+
+  QueueHandle_t fila_telemetria = (QueueHandle_t)pvParameters;    
+
+  telemetry_data_t telemetria = {0};
+
+    while(true){
+
+      BaseType_t recebeu = xQueueReceive(
+                                          fila_telemetria,
+                                          &telemetria,
+                                          portMAX_DELAY
+                                        );
+
+      if(recebeu == pdTRUE){
+        printf("Temperatura TASK TELEMETRIA: %.2f C\n", telemetria.dados.temperatura_c);
+      }
+    }
+
   }
 
   void taskBotao(void *pvParameters){
@@ -595,29 +642,30 @@ void app_main() {
     return;
   }
 
-  xTaskCreate(
-    taskControle,
-    "taskControle",
-    4096,
-    fila_sensores,
-    5,
-    &taskControleHandle
-  );
-
   static sensor_task_context_t sensor_ctx;
 
   sensor_ctx.mpu_handle = dev_handle;
   sensor_ctx.adc_handle = adc1_handle;
   sensor_ctx.fila = fila_sensores;
 
-  xTaskCreate(
-    taskSensores,
-    "taskSensores",
-    4096,
-    &sensor_ctx,
+  QueueHandle_t fila_telemetria;
+
+  fila_telemetria = xQueueCreate(
     5,
-    NULL
+    sizeof(telemetry_data_t)
   );
+
+  if(fila_telemetria == NULL){
+    printf("Erro ao criar fila de telemetria\n");
+    return;
+  }
+
+  static control_task_context_t control_ctx;
+
+  control_ctx.fila_sensores = fila_sensores;
+  control_ctx.fila_telemetria = fila_telemetria;
+
+
 
   gpio_config_t led_config = {
     .pin_bit_mask = 
@@ -633,32 +681,18 @@ void app_main() {
   ESP_ERROR_CHECK(gpio_config(&led_config));
 
   gpio_config_t botao_config = {
-    .pin_bit_mask = 1ULL << BOTAO,
-    .mode = GPIO_MODE_INPUT,
-    .pull_up_en = GPIO_PULLUP_DISABLE,
-    .pull_down_en = GPIO_PULLDOWN_ENABLE,
-    .intr_type = GPIO_INTR_POSEDGE
-  };
+                                .pin_bit_mask = 1ULL << BOTAO,
+                                .mode = GPIO_MODE_INPUT,
+                                .pull_up_en = GPIO_PULLUP_DISABLE,
+                                .pull_down_en = GPIO_PULLDOWN_ENABLE,
+                                .intr_type = GPIO_INTR_POSEDGE
+                              };
 
-  xTaskCreate(
-    taskBotao,
-    "taskBotao",
-    2048,
-    NULL,
-    5,
-    &taskBotaoHandle
-  );
 
   ESP_ERROR_CHECK(gpio_config(&botao_config));
 
   ESP_ERROR_CHECK(gpio_install_isr_service(0));
 
-  ESP_ERROR_CHECK(gpio_isr_handler_add(
-                                        BOTAO,
-                                        botao_isr,
-                                        NULL
-                                      )
-  );
 
   ledc_timer_config_t timer_config = {
                                     .speed_mode = LEDC_LOW_SPEED_MODE,
@@ -668,7 +702,11 @@ void app_main() {
                                     .clk_cfg = LEDC_AUTO_CLK
                                   };
 
-  ledc_timer_config(&timer_config);
+  esp_err_t erro = ledc_timer_config(&timer_config);
+    if(erro != ESP_OK){
+        printf("Erro ao configurar LEDC_TIMER_CONFIG\n");
+        abort();
+    }
 
   ledc_channel_config_t channel_config = {
                                   .gpio_num = BUZZER,
@@ -678,18 +716,21 @@ void app_main() {
                                   .duty = 0,
                                   .hpoint = 0
                                 };
-
-  ledc_channel_config(&channel_config);    
-
+    
+  erro = ledc_channel_config(&channel_config);  
+    if(erro != ESP_OK){
+        printf("Erro ao configurar LEDC_CHANNEL_CONFIG\n");
+        abort();
+    }
 
     uart_config_t uart1_config = {
-        .baud_rate = 115200,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT
-    };
+                                  .baud_rate = 115200,
+                                  .data_bits = UART_DATA_8_BITS,
+                                  .parity = UART_PARITY_DISABLE,
+                                  .stop_bits = UART_STOP_BITS_1,
+                                  .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+                                  .source_clk = UART_SCLK_DEFAULT
+                              };
 
     ESP_ERROR_CHECK(uart_param_config(UART1_PORT, &uart1_config));  
 
@@ -712,16 +753,14 @@ void app_main() {
                                         )
     );
 
-
-
     uart_config_t uart2_config = {
-      .baud_rate = 115200,
-      .data_bits = UART_DATA_8_BITS,
-      .parity = UART_PARITY_DISABLE,
-      .stop_bits = UART_STOP_BITS_1,
-      .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-      .source_clk = UART_SCLK_DEFAULT
-    };
+                                  .baud_rate = 115200,
+                                  .data_bits = UART_DATA_8_BITS,
+                                  .parity = UART_PARITY_DISABLE,
+                                  .stop_bits = UART_STOP_BITS_1,
+                                  .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+                                  .source_clk = UART_SCLK_DEFAULT
+                                };
 
   ESP_ERROR_CHECK(uart_param_config(UART2_PORT, &uart2_config)); 
 
@@ -740,6 +779,74 @@ void app_main() {
                                         0, 
                                         NULL, 
                                         0
+                                      )
+  ); 
+
+  BaseType_t task_result = xTaskCreate(
+                                    taskControle,
+                                    "taskControle",
+                                    4096,
+                                    &control_ctx,
+                                    5,
+                                    &taskControleHandle
+                                  );
+
+  if( task_result != pdPASS )
+    {
+        printf("Erro ao Criar a taskControle\n");
+        abort();
+    }
+
+  task_result = xTaskCreate(
+                          taskSensores,
+                          "taskSensores",
+                          4096,
+                          &sensor_ctx,
+                          5,
+                          NULL
+                        );
+
+  if( task_result != pdPASS )
+    {
+        printf("Erro ao Criar a taskSensores\n");
+        abort();
+    }
+
+
+  task_result = xTaskCreate(
+                          taskBotao,
+                          "taskBotao",
+                          2048,
+                          NULL,
+                          5,
+                          &taskBotaoHandle
+                        );
+
+  if( task_result != pdPASS )
+    {
+        printf("Erro ao Criar a taskBotao\n");
+        abort();
+    }
+
+  task_result = xTaskCreate(
+                          taskTelemetria,
+                          "taskTelemetria",
+                          2048,
+                          fila_telemetria,
+                          5,
+                          &taskTelemetriaHandle
+                        );
+
+  if( task_result != pdPASS )
+    {
+        printf("Erro ao Criar a taskTelemetria\n");
+        abort();
+    }    
+
+  ESP_ERROR_CHECK(gpio_isr_handler_add(
+                                        BOTAO,
+                                        botao_isr,
+                                        NULL
                                       )
   );
 
