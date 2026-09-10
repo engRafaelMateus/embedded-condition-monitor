@@ -448,7 +448,7 @@ typedef struct{
       
       telemetria.estado = estado;
 
-        atualiza_leds(estado); 
+      atualiza_leds(estado); 
 
       if (estado != STATE_CRITICAL) {
           alarme_reconhecido = false;
@@ -531,10 +531,37 @@ typedef struct{
                                         );
 
       if(recebeu == pdTRUE){
+
+        uart_write_bytes(
+                          UART1_PORT,
+                          &telemetria,
+                          sizeof(telemetria)
+                        );
         printf("Temperatura TASK TELEMETRIA: %.2f C\n", telemetria.dados.temperatura_c);
       }
+    vTaskDelay(pdMS_TO_TICKS(500));
+    }
+  }
+
+  void taskLerTelemetria(void *pvParameters){
+
+    telemetry_data_t buffer = {0};
+
+    while(true){
+
+    int bytes_lidos = uart_read_bytes(
+                                        UART2_PORT,
+                                        &buffer,
+                                        sizeof(buffer),
+                                        pdMS_TO_TICKS(100)
+                                      );     
+
+    if(bytes_lidos == sizeof(buffer)){
+
+      printf("Ler Telemetria recebeu: Temperatura - %.2f C\n", buffer.dados.temperatura_c);
     }
 
+    }
   }
 
   void taskBotao(void *pvParameters){
@@ -842,6 +869,20 @@ void app_main() {
         printf("Erro ao Criar a taskTelemetria\n");
         abort();
     }    
+
+    task_result = xTaskCreate(
+                                taskLerTelemetria,
+                                "taskLerTelemetria",
+                                2048,
+                                NULL,
+                                5,
+                                NULL
+                            );
+
+    if (task_result != pdPASS) {
+        printf("Erro ao criar taskLerTelemetria\n");
+        abort();
+    }
 
   ESP_ERROR_CHECK(gpio_isr_handler_add(
                                         BOTAO,
