@@ -546,19 +546,27 @@ typedef struct{
   void taskLerTelemetria(void *pvParameters){
 
     telemetry_data_t buffer = {0};
+    size_t total_recebido = 0;
 
     while(true){
 
     int bytes_lidos = uart_read_bytes(
                                         UART2_PORT,
-                                        &buffer,
-                                        sizeof(buffer),
+                                        (uint8_t *)&buffer + total_recebido,
+                                        sizeof(buffer) - total_recebido,
                                         pdMS_TO_TICKS(100)
                                       );     
 
-    if(bytes_lidos == sizeof(buffer)){
+    if(bytes_lidos > 0){
+      total_recebido += bytes_lidos;
+      
+      if(total_recebido == sizeof(buffer)){
 
-      printf("Ler Telemetria recebeu: Temperatura - %.2f C\n", buffer.dados.temperatura_c);
+        printf("Ler Telemetria recebeu: Temperatura - %.2f C\n", buffer.dados.temperatura_c);
+        total_recebido = 0; 
+      }
+    }else if (bytes_lidos < 0){
+        printf("ERRO ao receber os bytes\n");
     }
 
     }
