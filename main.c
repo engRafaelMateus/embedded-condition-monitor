@@ -152,6 +152,10 @@
 #include <driver/gpio.h>
 #include <driver/ledc.h>
 #include <driver/uart.h>
+#include <driver/twai.h>
+#include "esp_err.h"
+#include<math.h>
+
 
 
 
@@ -163,6 +167,8 @@
 
 #define MPU6050_REG_TEMP_OUT_H   0x41
 #define MPU6050_REG_ACCEL_XOUT_H 0x3B
+
+#define CAN_MODO_TESTE 1
 
 #define LED_NORMAL   25
 #define LED_WARNING  26
@@ -271,7 +277,6 @@ typedef struct{
     return resultado;
   }
 
-
   /*
     abaixo de 45 °C     → NORMAL
     45 até abaixo de 60 → WARNING
@@ -311,7 +316,6 @@ typedef struct{
     ); 
   }  
 
-
   void taskSensores(void *pvParameters){
 
     sensor_task_context_t *ctx = (sensor_task_context_t *)pvParameters;
@@ -330,8 +334,7 @@ typedef struct{
         }
             
         leitura.temperatura_c = (leitura.temperatura_raw / 340.0f) + 36.53f;
-
-        printf("Temperatura: %.2f C\n", leitura.temperatura_c);
+        printf("Temperatura Sensor: %.2f C\n", leitura.temperatura_c);
 
 
       resultado = ler_aceleracao_raw(
@@ -397,8 +400,7 @@ typedef struct{
     }
 
   }
-
-
+  
   void atualiza_leds(system_state_t estado){
 
     if(estado == STATE_NORMAL){
@@ -419,7 +421,6 @@ typedef struct{
 
     }
   }
-
 
   void taskControle(void *pvParameters){
 
@@ -516,31 +517,153 @@ typedef struct{
     }
   }
 
+  void ler_telemetria_can(const twai_message_t *message){
+
+    if(message->identifier == 0x200 && 
+      message->extd == 0 && 
+      message->rtr == 0 && 
+      message->data_length_code == 3)
+    {
+      if (message->data[2] != 0) {
+        printf("Temperatura indisponivel: status de aquisicao %u\n",
+              (unsigned int)message->data[2]);
+        return;
+      }
+
+        uint16_t bits = (message->data[0] * 256u) + message->data[1];
+        int32_t temperatura_recebida_x100 = bits;
+
+        if (bits >= 32768u) {
+            temperatura_recebida_x100 -= 65536;
+        }
+
+        float conversao = temperatura_recebida_x100 / 100.0f;
+        printf("[TESTE CAN RX] Temperatura = %.2f C\n", conversao);
+
+    }else{
+        printf("Mensagem rejeitada: formato inesperado\n");
+    }
+  }
+  
+  void enviar_mensagem(const twai_message_t *message){
+
+    if(message->data_length_code > 8){
+      printf("Mensagem Rejeita\n");
+      return;
+    }
+
+    #if CAN_MODO_TESTE
+
+        printf("[TESTE CAN TX] ID=0x%X DLC=%d DATA=",
+          (unsigned int)message->identifier,
+          message->data_length_code);
+
+        for (int i = 0; i < message->data_length_code; i++) {
+            printf("%02X ", (unsigned int)message->data[i]);
+        }
+
+        printf("\n");
+        ler_telemetria_can(message);
+
+    #else
+
+        esp_err_t resultado = twai_transmit(
+                                              message,
+                                              pdMS_TO_TICKS(100)
+                                            );
+
+        if (resultado != ESP_OK) {
+            printf("[CAN TX] Erro ao solicitar envio: %s\n",
+            esp_err_to_name(resultado));
+            return;
+        }
+
+        printf("[CAN TX] Frame aceito para transmissao: ID=0x%X\n",
+          (unsigned int)message->identifier);
+
+    #endif
+
+  }
+
+  void enviar_telemetria_can(const telemetry_data_t *telemetria){
+
+    twai_message_t temp_message = {
+      .identifier = 0x200,
+      .extd = 0,
+      .rtr = 0,
+      .ss = 1,
+      .data_length_code = 3,
+      .data = {0},
+    };
+
+    int16_t temperatura_x100 = (int16_t)lroundf(telemetria->dados.temperatura_c * 100.0f);
+    uint16_t bits = (uint16_t)temperatura_x100;
+
+    temp_message.data[0] = bits >> 8;
+    temp_message.data[1] = bits & 0xFF;
+    temp_message.data[2] = 0;
+
+    enviar_mensagem(&temp_message);
+    
+    /*twai_message_t status_op_message = {
+      .identifier = 0x100,
+      .extd = 0,
+      .rtr = 0,
+      .ss = 1,
+      .data_length_code = 3,
+      .data = {0},
+    };
+
+
+    
+
+    twai_message_t adc_message = {
+      .identifier = 0x201,
+      .extd = 0,
+      .rtr = 0,
+      .ss = 1,
+      .data_length_code = 3,
+      .data = {0},
+    };
+
+    twai_message_t acel_message = {
+      .identifier = 0x202,
+      .extd = 0,
+      .rtr = 0,
+      .ss = 1,
+      .data_length_code = 7,
+      .data = {0},
+    };*/
+
+  }
+
   void taskTelemetria(void *pvParameters){
 
-  QueueHandle_t fila_telemetria = (QueueHandle_t)pvParameters;    
+    QueueHandle_t fila_telemetria = (QueueHandle_t)pvParameters;    
 
-  telemetry_data_t telemetria = {0};
+    telemetry_data_t telemetria = {0};
 
-    while(true){
 
-      BaseType_t recebeu = xQueueReceive(
-                                          fila_telemetria,
-                                          &telemetria,
-                                          portMAX_DELAY
-                                        );
+      while(true){
 
-      if(recebeu == pdTRUE){
+        BaseType_t recebeu = xQueueReceive(
+                                            fila_telemetria,
+                                            &telemetria,
+                                            portMAX_DELAY
+                                          );
 
-        uart_write_bytes(
-                          UART1_PORT,
-                          &telemetria,
-                          sizeof(telemetria)
-                        );
-        printf("Temperatura TASK TELEMETRIA: %.2f C\n", telemetria.dados.temperatura_c);
+        if(recebeu == pdTRUE){
+
+          enviar_telemetria_can(&telemetria);
+
+          uart_write_bytes(
+                            UART1_PORT,
+                            &telemetria,
+                            sizeof(telemetria)
+                          );
+        }
+      vTaskDelay(pdMS_TO_TICKS(500));
       }
-    vTaskDelay(pdMS_TO_TICKS(500));
-    }
   }
 
   void taskLerTelemetria(void *pvParameters){
@@ -550,25 +673,26 @@ typedef struct{
 
     while(true){
 
-    int bytes_lidos = uart_read_bytes(
-                                        UART2_PORT,
-                                        (uint8_t *)&buffer + total_recebido,
-                                        sizeof(buffer) - total_recebido,
-                                        pdMS_TO_TICKS(100)
-                                      );     
+      int bytes_lidos = uart_read_bytes(
+                                          UART2_PORT,
+                                          (uint8_t *)&buffer + total_recebido,
+                                          sizeof(buffer) - total_recebido,
+                                          pdMS_TO_TICKS(100)
+                                        );     
 
-    if(bytes_lidos > 0){
-      total_recebido += bytes_lidos;
+      //Verificação se chegaram todos os bytes de telemetria antes de fazer a leitura 
+      if(bytes_lidos > 0){ 
+        total_recebido += bytes_lidos;
+              
+        if(total_recebido == sizeof(buffer)){
+
+          printf("UART: Temperatura = %.2f C\n", buffer.dados.temperatura_c);
+          total_recebido = 0; 
+        }
+        }else if (bytes_lidos < 0){
+            printf("ERRO ao receber os bytes\n");
+        }
       
-      if(total_recebido == sizeof(buffer)){
-
-        printf("Ler Telemetria recebeu: Temperatura - %.2f C\n", buffer.dados.temperatura_c);
-        total_recebido = 0; 
-      }
-    }else if (bytes_lidos < 0){
-        printf("ERRO ao receber os bytes\n");
-    }
-
     }
   }
 
@@ -610,6 +734,8 @@ typedef struct{
 
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
   }
+
+
 
 void app_main() {
 
@@ -816,6 +942,36 @@ void app_main() {
                                         0
                                       )
   ); 
+
+  #if !CAN_MODO_TESTE
+
+    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT( GPIO_NUM_17, 
+                                                                  GPIO_NUM_5, 
+                                                                  TWAI_MODE_NORMAL
+                                                                );
+
+    twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
+
+    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+    esp_err_t resultado = twai_driver_install(&g_config, &t_config, &f_config);
+
+      if (resultado == ESP_OK) {
+          printf("Driver installed\n");
+      } else {
+          printf("Failed to install driver\n");
+          return;
+      }  
+
+      if (twai_start() == ESP_OK) {
+          printf("Driver started\n");
+      } else {
+          printf("Failed to start driver\n");
+          return;
+      }
+
+  #endif
+
 
   BaseType_t task_result = xTaskCreate(
                                     taskControle,
