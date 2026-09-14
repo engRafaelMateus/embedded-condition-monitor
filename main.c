@@ -540,6 +540,63 @@ typedef struct{
         float conversao = temperatura_recebida_x100 / 100.0f;
         printf("[TESTE CAN RX] Temperatura = %.2f C\n", conversao);
 
+    }else if( message->identifier == 0x201 &&
+              message->extd == 0 &&
+              message->rtr == 0 &&
+              message->data_length_code == 3
+            )
+    {
+      if (message->data[2] != 0) {
+        printf("Leitura indisponivel: status de aquisicao %u\n",
+              (unsigned int)message->data[2]);
+        return;
+      }
+
+      uint16_t ADC = (message->data[0] * 256u) + message->data[1];
+      printf("[TESTE CAN RX] ADC = %d\n", ADC);
+
+    }else if( message->identifier == 0x202 &&
+              message->extd == 0 &&
+              message->rtr == 0 &&
+              message->data_length_code == 7
+            )
+    {
+      if (message->data[6] != 0) {
+        printf("Leitura indisponivel: status de aquisicao %u\n",
+              (unsigned int)message->data[6]);
+        return;
+      }
+
+      uint16_t bits = (message->data[0] * 256u) + message->data[1];
+      int32_t ax_g_x1000 = bits;
+
+        if (bits >= 32768u) {
+            ax_g_x1000 -= 65536;
+        }
+
+        float conversao_x = ax_g_x1000 / 1000.0f;
+
+        bits = (message->data[2] * 256u) + message->data[3];
+        int32_t ay_g_x1000 = bits;
+
+          if (bits >= 32768u) {
+              ay_g_x1000 -= 65536;
+          }
+
+        float conversao_y = ay_g_x1000 / 1000.0f;
+
+        bits = (message->data[4] * 256u) + message->data[5];
+        int32_t az_g_x1000 = bits;
+
+          if (bits >= 32768u) {
+              az_g_x1000 -= 65536;
+          }
+
+        float conversao_z = az_g_x1000 / 1000.0f;
+
+
+        printf("[TESTE CAN RX]\nAcel_x = %.3f g\nAcel_y = %.3f g\nAcel_z = %.3f g\n", conversao_x, conversao_y, conversao_z);
+
     }else{
         printf("Mensagem rejeitada: formato inesperado\n");
     }
@@ -554,9 +611,7 @@ typedef struct{
 
     #if CAN_MODO_TESTE
 
-        printf("[TESTE CAN TX] ID=0x%X DLC=%d DATA=",
-          (unsigned int)message->identifier,
-          message->data_length_code);
+        printf("[TESTE CAN TX] ID=0x%X DLC=%d DATA=", (unsigned int)message->identifier, message->data_length_code);
 
         for (int i = 0; i < message->data_length_code; i++) {
             printf("%02X ", (unsigned int)message->data[i]);
@@ -605,18 +660,6 @@ typedef struct{
 
     enviar_mensagem(&temp_message);
     
-    /*twai_message_t status_op_message = {
-      .identifier = 0x100,
-      .extd = 0,
-      .rtr = 0,
-      .ss = 1,
-      .data_length_code = 3,
-      .data = {0},
-    };
-
-
-    
-
     twai_message_t adc_message = {
       .identifier = 0x201,
       .extd = 0,
@@ -626,12 +669,52 @@ typedef struct{
       .data = {0},
     };
 
+    uint16_t valor_ADC = telemetria->dados.valor_adc;
+    adc_message.data[0] = valor_ADC >> 8;
+    adc_message.data[1] = valor_ADC & 0xFF;
+    adc_message.data[2] = 0;
+
+    enviar_mensagem(&adc_message);
+
     twai_message_t acel_message = {
       .identifier = 0x202,
       .extd = 0,
       .rtr = 0,
       .ss = 1,
       .data_length_code = 7,
+      .data = {0},
+    };
+
+    int16_t ax_x1000 = (int16_t)lroundf(telemetria->dados.ax_g * 1000.0f);
+    uint16_t bits_ax = (uint16_t)ax_x1000;
+
+    acel_message.data[0] = bits_ax >> 8;
+    acel_message.data[1] = bits_ax & 0xFF;
+
+    int16_t ay_x1000 = (int16_t)lroundf(telemetria->dados.ay_g * 1000.0f);
+    uint16_t bits_ay = (uint16_t)ay_x1000;
+
+    acel_message.data[2] = bits_ay >> 8;
+    acel_message.data[3] = bits_ay & 0xFF;
+
+    int16_t az_x1000 = (int16_t)lroundf(telemetria->dados.az_g * 1000.0f);
+    uint16_t bits_az = (uint16_t)az_x1000;
+
+    acel_message.data[4] = bits_az >> 8;
+    acel_message.data[5] = bits_az & 0xFF;
+    
+    
+    acel_message.data[6] = 0;
+
+    enviar_mensagem(&acel_message);
+
+
+    /*twai_message_t status_op_message = {
+      .identifier = 0x100,
+      .extd = 0,
+      .rtr = 0,
+      .ss = 1,
+      .data_length_code = 3,
       .data = {0},
     };*/
 
