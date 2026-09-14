@@ -156,9 +156,6 @@
 #include "esp_err.h"
 #include<math.h>
 
-
-
-
 #define I2C_PORT I2C_NUM_0
 #define I2C_SDA 21
 #define I2C_SCL 22
@@ -212,9 +209,9 @@ typedef struct {
 } sensor_data_t;
 
 typedef enum {
-    STATE_NORMAL,
-    STATE_WARNING,
-    STATE_CRITICAL
+    STATE_NORMAL  = 0,
+    STATE_WARNING = 1,
+    STATE_CRITICAL= 2
 } system_state_t;
 
 typedef struct {
@@ -517,7 +514,66 @@ typedef struct{
     }
   }
 
-  void ler_telemetria_can(const twai_message_t *message){
+  /* PROTOCOLO CAN DE TELEMETRIA
+    *
+    * CAN classico, IDs padrao de 11 bits, frames de dados (extd=0, rtr=0).
+    * Velocidade configurada: 500 kbit/s.
+    * Publicacao dos quatro frames a cada telemetria processada, sem consulta
+    * previa do receptor. A saida UART permanece ativa.
+    *
+    * REPRESENTACAO
+    * - Campos de 16 bits: byte mais significativo primeiro (big-endian).
+    * - Temperatura e aceleracao: inteiros com sinal em complemento de dois.
+    * - Valores float sao escalados e arredondados com lroundf() no envio.
+    * - O receptor recupera o sinal antes de dividir pela escala.
+    *
+    * ID 0x100 — ESTADO OPERACIONAL — DLC 3
+    * data[0]   : estado: 0=NORMAL, 1=WARNING, 2=CRITICAL.
+    * data[1]   : alarme reconhecido: 0=nao, 1=sim.
+    * data[2]   : validade do estado: 0=valido,
+    *             1=indisponivel por falha de aquisicao.
+    * Reconhecer o alarme nao elimina a condicao CRITICAL.
+    *
+    * ID 0x200 — TEMPERATURA — DLC 3
+    * data[0..1]: int16, temperatura em graus Celsius multiplicada por 100.
+    * data[2]   : status da aquisicao: 0=valida, 1=falha.
+    * Resolucao do transporte: 0,01 C. Faixa: -327,68 a +327,67 C.
+    * Exemplo: 24,00 C -> 2400 -> 09 60.
+    *
+    * ID 0x201 — ADC — DLC 3
+    * data[0..1]: uint16, valor ADC disponivel na telemetria.
+    * data[2]   : status da aquisicao: 0=valida, 1=falha.
+    * Valor sem conversao para unidade fisica de pressao.
+    * Exemplo: 2048 -> 08 00.
+    *
+    * ID 0x202 — ACELERACAO — DLC 7
+    * data[0..1]: int16, eixo X em g multiplicado por 1000.
+    * data[2..3]: int16, eixo Y em g multiplicado por 1000.
+    * data[4..5]: int16, eixo Z em g multiplicado por 1000.
+    * data[6]   : status da aquisicao: 0=valida, 1=falha.
+    * Resolucao do transporte: 0,001 g. Faixa: -32,768 a +32,767 g.
+    * Exemplo: -0,250 g -> -250 -> FF 06.
+    *
+    * VALIDACAO E LIMITACOES
+    * - Conferir ID, formato, DLC e status antes de interpretar o payload.
+    * - Estado deve estar entre 0 e 2; reconhecimento deve ser 0 ou 1.
+    * - Status diferente de zero impede usar a medicao/estado como valido.
+    * - Atualmente apenas ciclos validos chegam a telemetria: status enviado=0.
+    *   A publicacao de falhas ainda precisa ser implementada.
+    * - Conversoes pressupõem valores validos dentro das faixas representaveis.
+    * - Frames separados nao possuem contador de sequencia para associar ciclos.
+    *
+    * MODOS DE EXECUCAO
+    * CAN_MODO_TESTE=1: imprime bytes e chama o interpretador localmente.
+    * CAN_MODO_TESTE=0: inicializa TWAI e solicita envio com twai_transmit().
+    * O retorno ESP_OK indica aceitacao pelo driver, nao entrega ao receptor.
+    *
+    * Codificacao e interpretacao testadas localmente.
+    * Recepcao via twai_receive() e validacao fisica do barramento pendentes.
+    */
+
+
+  void processar_frame_can(const twai_message_t *message){
 
     if(message->identifier == 0x200 && 
       message->extd == 0 && 
@@ -597,6 +653,28 @@ typedef struct{
 
         printf("[TESTE CAN RX]\nAcel_x = %.3f g\nAcel_y = %.3f g\nAcel_z = %.3f g\n", conversao_x, conversao_y, conversao_z);
 
+    }else if( message->identifier == 0x100 &&
+              message->extd == 0 &&
+              message->rtr == 0 &&
+              message->data_length_code == 3
+            )
+    {
+      if (message->data[2] != 0) {
+        printf("Leitura indisponivel: status de aquisicao %u\n",
+              (unsigned int)message->data[2]);
+        return;
+      }
+
+      if (message->data[0] > 2 || message->data[1] > 1) {
+        printf("Mensagem rejeitada: estado ou reconhecimento invalido\n");
+        return;
+      }
+
+      uint8_t estado  = message->data[0];
+      bool alarme_reconhecido = message->data[1];
+
+      printf("[TESTE CAN RX]\nSTATUS = %d\nALARME = %d\n", estado, alarme_reconhecido);
+
     }else{
         printf("Mensagem rejeitada: formato inesperado\n");
     }
@@ -618,7 +696,7 @@ typedef struct{
         }
 
         printf("\n");
-        ler_telemetria_can(message);
+        processar_frame_can(message);
 
     #else
 
@@ -709,16 +787,53 @@ typedef struct{
     enviar_mensagem(&acel_message);
 
 
-    /*twai_message_t status_op_message = {
+    twai_message_t status_op_message = {
       .identifier = 0x100,
       .extd = 0,
       .rtr = 0,
       .ss = 1,
       .data_length_code = 3,
       .data = {0},
-    };*/
+    };
+
+    status_op_message.data[0] = telemetria->estado;
+    status_op_message.data[1] = telemetria->alarme_reconhecido;
+    status_op_message.data[2] = 0;
+
+    enviar_mensagem(&status_op_message);
 
   }
+  #if !CAN_MODO_TESTE
+
+  //Recebe frames do driver TWAI e entrega ao interpretador do protocolo.
+
+  void taskReceberCAN(void *pvParameters)
+  {
+      (void)pvParameters;
+
+      twai_message_t message = {0};
+
+      while (true) {
+          esp_err_t resultado = twai_receive(
+              &message,
+              pdMS_TO_TICKS(1000)
+          );
+
+          if (resultado == ESP_OK) {
+              processar_frame_can(&message);
+          }
+          else if (resultado == ESP_ERR_TIMEOUT) {
+              // Nenhum frame chegou durante a espera.
+              continue;
+          }
+          else {
+              printf("[CAN RX] Erro ao receber: %s\n", esp_err_to_name(resultado));
+              vTaskDelay(pdMS_TO_TICKS(100));
+          }
+      }
+  }
+
+#endif
 
   void taskTelemetria(void *pvParameters){
 
@@ -1052,6 +1167,20 @@ void app_main() {
           printf("Failed to start driver\n");
           return;
       }
+
+      BaseType_t task_criada = xTaskCreate(
+        taskReceberCAN,
+        "taskReceberCAN",
+        4096,
+        NULL,
+        5,
+        NULL
+    );
+
+    if (task_criada != pdPASS) {
+        printf("[CAN RX] Erro ao criar task de recepcao\n");
+        return;
+    }
 
   #endif
 
