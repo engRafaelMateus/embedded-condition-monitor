@@ -452,10 +452,10 @@ The goal is not only to implement functionality, but also to understand the comp
 - [x] PWM buzzer
 - [x] UART configuration
 - [x] UART telemetry
+- [x] CAN/TWAI communication
 
 ### Next Steps
 
-- [ ] CAN/TWAI communication
 - [ ] RS-485 communication
 - [ ] Structured communication protocol
 - [ ] Heartbeat and timeout detection
