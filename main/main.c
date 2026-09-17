@@ -244,6 +244,16 @@ typedef struct
   bool alarme_reconhecido;
 } telemetry_data_t;
 
+enum
+{
+  MB_INPUT_ADC = 0,
+  MB_INPUT_TEMP,
+  MB_INPUT_STATE,
+  MB_INPUT_COUNT
+};
+
+static uint16_t modbus_input_regs[MB_INPUT_COUNT] = {0};
+
 esp_err_t ler_temperatura_raw(
     i2c_master_dev_handle_t dev_handle,
     int16_t *temperatura_raw)
@@ -894,6 +904,17 @@ void taskTelemetria(void *pvParameters){
     {
 
     enviar_telemetria_can(&telemetria);
+    
+    esp_err_t resultado = mbc_slave_lock(slave_handle);
+
+      if (resultado == ESP_OK){
+      
+          modbus_input_regs[MB_INPUT_ADC] = (uint16_t)telemetria.dados.valor_adc;
+          modbus_input_regs[MB_INPUT_TEMP] = (uint16_t)(int16_t)lroundf(telemetria.dados.temperatura_c * 100.0f);
+          modbus_input_regs[MB_INPUT_STATE] = (uint16_t)telemetria.estado;
+          
+        mbc_slave_unlock(slave_handle);
+      }
 
 #if !MODBUS_LOOPBACK_TEST
       
@@ -953,32 +974,43 @@ static void IRAM_ATTR botao_isr(void *arg)
 #if MODBUS_LOOPBACK_TEST
 
   void taskModbusMaster(void *pvParameters){
+
       vTaskDelay(pdMS_TO_TICKS(1000));
 
       mb_param_request_t request = {
           .slave_addr = MB_SLAVE_ADDR,
           .command = MODBUS_FUNC_READ_INPUT_REGISTERS,
           .reg_start = MB_REG_INPUT_START,
-          .reg_size = 1
+          .reg_size = MB_INPUT_COUNT
       };
 
-      uint16_t valor_recebido = 0;
-
+      uint16_t regs_recebidos[MB_INPUT_COUNT] = {0};
+      
       esp_err_t resultado = mbc_master_send_request(
-          master_handle,
-          &request,
-          &valor_recebido
+        master_handle,
+        &request,
+        regs_recebidos
       );
-
+            
       if (resultado == ESP_OK)
       {
-          printf("MODBUS MASTER recebeu: %u\n", valor_recebido);
+
+      uint16_t adc = regs_recebidos[MB_INPUT_ADC];
+      uint16_t estado = regs_recebidos[MB_INPUT_STATE];
+      int16_t temperatura_x100 = (int16_t)regs_recebidos[MB_INPUT_TEMP];
+      float temperatura = temperatura_x100 / 100.0f;
+
+        printf("MODBUS MASTER recebeu:\n");        
+        printf("MODBUS ADC: %d\n", adc);
+        printf("MODBUS ESTADO: %d\n", estado);
+        printf("MODBUS TEMPERATURA: %.2f\n", temperatura);
+
       }
       else
       {
           printf(
-              "MODBUS MASTER erro: %s\n",
-              esp_err_to_name(resultado)
+            "MODBUS MASTER erro: %s\n",
+            esp_err_to_name(resultado)
           );
       }
 
@@ -988,9 +1020,6 @@ static void IRAM_ATTR botao_isr(void *arg)
 
 
 void app_main(){
-
-  static uint16_t reg_modbus_teste = 1234;
-
     mb_communication_info_t slave_config = {
         .ser_opts.port = MB_PORT_NUM,
         .ser_opts.mode = MB_RTU,
@@ -1021,8 +1050,8 @@ void app_main(){
     mb_register_area_descriptor_t mb_slave_input_regs = {
       .type = MB_PARAM_INPUT,
       .start_offset = MB_REG_INPUT_START,
-      .address = &reg_modbus_teste,
-      .size = sizeof(reg_modbus_teste)
+      .address = modbus_input_regs,
+      .size = sizeof(modbus_input_regs)
     };
 
     ESP_ERROR_CHECK(
@@ -1060,18 +1089,18 @@ void app_main(){
 
       static const mb_parameter_descriptor_t master_descriptor[] = {
         {
-            .cid = 0,
-            .param_key = "valor_teste",
-            .param_units = "",
-            .mb_slave_addr = MB_SLAVE_ADDR,
-            .mb_param_type = MB_PARAM_INPUT,
-            .mb_reg_start = MB_REG_INPUT_START,
-            .mb_size = 1,
-            .param_offset = 0,
-            .param_type = PARAM_TYPE_U16,
-            .param_size = 2,
-            .param_opts = { .opt1 = 0, .opt2 = 0, .opt3 = 0 },
-            .access = PAR_PERMS_READ
+          .cid = 0,
+          .param_key = "adc",
+          .param_units = "",
+          .mb_slave_addr = MB_SLAVE_ADDR,
+          .mb_param_type = MB_PARAM_INPUT,
+          .mb_reg_start = MB_INPUT_ADC,
+          .mb_size = 1,
+          .param_offset = 0,
+          .param_type = PARAM_TYPE_U16,
+          .param_size = 2,
+          .param_opts = { .opt1 = 0, .opt2 = 0, .opt3 = 0 },
+          .access = PAR_PERMS_READ
         }
       };  
 
