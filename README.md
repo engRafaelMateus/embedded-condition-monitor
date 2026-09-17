@@ -1,74 +1,111 @@
 # Embedded Condition Monitor
 
-Embedded platform for **equipment condition monitoring, diagnostics and telemetry**, developed with **ESP32, ESP-IDF, FreeRTOS and C**, with progressive integration of C++ for the embedded Linux gateway.
+Embedded monitoring and telemetry platform developed with **ESP32, ESP-IDF, FreeRTOS and C**, focused on embedded systems, firmware architecture and industrial communication.
 
-The project implements an embedded monitoring node capable of acquiring sensor data, classifying equipment operating conditions, generating local alarms and transmitting telemetry to external devices.
+The project implements an embedded monitoring node capable of acquiring sensor data, processing measurements, classifying equipment operating conditions, generating local alarms and transmitting telemetry through multiple communication interfaces.
 
-The architecture is being progressively expanded toward industrial communication using **CAN/TWAI, RS-485 and an embedded Linux gateway**.
-
----
-
-## Project Goals
-
-The main objective of this project is to develop a complete embedded system covering:
-
-- Sensor acquisition
-- Real-time multitasking architecture
-- Equipment condition classification
-- Hardware control
-- Alarm management
-- Telemetry
-- Device-to-device communication
-- Fault detection and recovery
-- Hardware validation
-- Industrial communication
-- Embedded Linux integration
+The firmware is developed using native **ESP-IDF APIs** and a multitask architecture based on **FreeRTOS**.
 
 ---
 
-## Current Architecture
+## Overview
+
+The system currently integrates:
+
+* ESP32
+* ESP-IDF
+* FreeRTOS
+* MPU6050 via I2C
+* ADC Oneshot
+* GPIO interrupts
+* PWM / LEDC
+* UART
+* CAN / TWAI
+* Modbus RTU
+* FreeRTOS Queues
+* Task Notifications
+* Wokwi
+* Git / GitHub
+* CMake
+
+---
+
+## System Architecture
 
 ```text
-MPU6050
-Temperature + Acceleration
-        |
-       I2C
-        |
-        v
-   taskSensores
-        |
-        | FreeRTOS Queue
-        v
-   taskControle
-        |
-   +----+-------------------+
-   |                        |
-   v                        v
-Status LEDs             PWM Buzzer
-                            |
-                       Alarm Control
+                 +----------------+
+                 |    MPU6050     |
+                 | Temp + Accel   |
+                 +-------+--------+
+                         |
+                        I2C
+                         |
+                         v
+                  +--------------+
+                  | taskSensores |
+                  +------+-------+
+                         |
+                    Sensor Queue
+                         |
+                         v
+                  +--------------+
+                  | taskControle |
+                  +------+-------+
+                         |
+          +--------------+--------------+
+          |              |              |
+          v              v              v
+     Status LEDs     PWM Buzzer    Telemetry Queue
+                                         |
+                                         v
+                                  +---------------+
+                                  | taskTelemetria|
+                                  +-------+-------+
+                                          |
+                              +-----------+-----------+
+                              |                       |
+                              v                       v
+                         CAN / TWAI             UART Telemetry
+```
 
-Button
-  |
+Operator alarm acknowledgement is handled independently:
+
+```text
+Push Button
+    |
 GPIO Interrupt
-  |
-  v
-taskBotao
-  |
+    |
+    v
+   ISR
+    |
 Task Notification
-  |
-  v
+    |
+    v
+taskBotao
+    |
+Task Notification
+    |
+    v
 taskControle
+```
 
-taskControle
-     |
-     v
-Telemetry
-     |
-    UART
-     |
-     v
-External Device
+Modbus RTU uses an independent communication path:
+
+```text
+Modbus Master
+    |
+   UART1
+    |
+    v
+Modbus RTU
+    |
+   UART2
+    |
+    v
+Modbus Slave
+    |
+    v
+Input Registers
 ```
 
 ---
@@ -77,30 +114,120 @@ External Device
 
 ### Sensor Acquisition
 
-- MPU6050 integration using **I2C**
-- Temperature acquisition
-- Acceleration acquisition on X, Y and Z axes
-- Analog signal acquisition using **ADC Oneshot**
-- Multiple ADC sample averaging
-- Validation of sensor acquisition cycles
-- Invalid acquisition discard
-- Initial peripheral error handling
+The firmware performs digital and analog data acquisition using native ESP-IDF drivers.
+
+#### MPU6050
+
+Communication with the MPU6050 is implemented using the ESP32 I2C master driver.
+
+Acquired data:
+
+* Temperature
+* X-axis acceleration
+* Y-axis acceleration
+* Z-axis acceleration
+
+Raw sensor values are converted into engineering values used by the control and telemetry layers.
+
+#### ADC
+
+Analog acquisition is implemented using the **ESP-IDF ADC Oneshot driver**.
+
+The acquisition routine:
+
+* Performs multiple ADC samples
+* Accepts only valid readings
+* Calculates the average of 10 valid samples
+* Discards the acquisition cycle if enough valid samples cannot be obtained
+
+This reduces the influence of isolated acquisition errors before the data reaches the control layer.
+
+---
 
 ### FreeRTOS Architecture
 
-- Multiple independent tasks
-- Sensor acquisition task
-- Control task
-- Button/event task
-- Telemetry responsibility separated from sensor acquisition
-- Inter-task communication using **FreeRTOS Queues**
-- Event signaling using **Task Notifications**
-- Blocking task synchronization
-- GPIO interrupt handling
+The firmware uses multiple FreeRTOS tasks with separated responsibilities.
 
-### Equipment State Classification
+#### `taskSensores`
 
-The system classifies operating conditions into three states:
+Responsible for:
+
+* MPU6050 acquisition
+* Temperature processing
+* Acceleration processing
+* ADC acquisition
+* ADC averaging
+* Sensor data validation
+
+The resulting measurements are sent to the control layer through a **FreeRTOS Queue**.
+
+#### `taskControle`
+
+Responsible for:
+
+* Receiving sensor measurements
+* Evaluating equipment condition
+* Updating status LEDs
+* Managing the audible alarm
+* Processing operator alarm acknowledgement
+* Building the telemetry structure
+* Sending telemetry to the communication layer
+
+#### `taskTelemetria`
+
+Responsible for receiving structured telemetry and forwarding data to the configured communication interfaces.
+
+#### `taskBotao`
+
+Responsible for processing operator alarm acknowledgement.
+
+The GPIO ISR only generates an event, keeping interrupt execution short.
+
+Debounce and event processing are performed outside interrupt context.
+
+---
+
+### FreeRTOS Communication
+
+Structured data is transported between tasks using **FreeRTOS Queues**.
+
+```text
+taskSensores
+     |
+ sensor_data_t
+     |
+     v
+fila_sensores
+     |
+     v
+taskControle
+     |
+telemetry_data_t
+     |
+     v
+fila_telemetria
+     |
+     v
+taskTelemetria
+```
+
+Lightweight events are handled using **Task Notifications**.
+
+```text
+GPIO ISR
+   |
+   v
+taskBotao
+   |
+   v
+taskControle
+```
+
+---
+
+### Equipment State Machine
+
+The equipment operating condition is classified into three states:
 
 ```text
 NORMAL
@@ -110,389 +237,332 @@ CRITICAL
 
 Current thresholds:
 
-| Parameter | NORMAL | WARNING | CRITICAL |
-| --- | --- | --- | --- |
+| Parameter   | NORMAL  | WARNING    | CRITICAL |
+| ----------- | ------- | ---------- | -------- |
 | Temperature | < 45 °C | 45–59.9 °C | >= 60 °C |
-| Analog Input | < 2500 | 2500–3299 | >= 3300 |
+| ADC value   | < 2500  | 2500–3299  | >= 3300  |
 
-A **CRITICAL** condition has priority over WARNING and NORMAL states.
+A CRITICAL condition has priority over WARNING and NORMAL.
 
----
-
-### Alarm System
-
-- Green LED for NORMAL condition
-- Yellow LED for WARNING condition
-- Red LED for CRITICAL condition
-- Passive buzzer controlled using **LEDC PWM**
-- Operator alarm acknowledgement
-- Alarm acknowledgement does not modify the actual machine condition
-- Alarm acknowledgement automatically resets after leaving CRITICAL state
+The state is evaluated from the latest valid sensor acquisition cycle.
 
 ---
 
-### GPIO and Interrupts
+### Local Alarm System
 
-- GPIO input interrupt
-- Positive-edge detection
-- Short ISR execution
-- FreeRTOS notification from ISR
-- Context-switch request using `portYIELD_FROM_ISR`
-- Software debounce outside the ISR
-- Event forwarding between tasks using Task Notifications
+The monitoring node provides local visual and audible indication.
 
----
+Status indication:
 
-### UART Communication
+* Green LED: NORMAL
+* Yellow LED: WARNING
+* Red LED: CRITICAL
 
-- UART driver configured using native ESP-IDF APIs
-- UART TX and RX pins configured
-- Bidirectional UART communication infrastructure
-- Structured UART telemetry
-- Transmission of sensor measurements and equipment state
-- Separation between acquisition, control and communication responsibilities
+The buzzer is controlled through the ESP32 **LEDC PWM peripheral**.
+
+When the system enters CRITICAL state, the audible alarm is activated.
+
+The operator can acknowledge the alarm using a push button. Alarm acknowledgement silences the audible indication without changing the actual equipment condition.
+
+When the system leaves CRITICAL state, the acknowledgement state is automatically reset.
 
 ---
 
-## Telemetry
+### GPIO Interrupt Handling
 
-The telemetry layer is responsible for transporting operational measurements, equipment state and alarm information.
+The acknowledgement button uses GPIO interrupt processing.
+
+The implementation includes:
+
+* Positive-edge GPIO interrupt
+* Short ISR execution
+* `vTaskNotifyGiveFromISR()`
+* `portYIELD_FROM_ISR()`
+* Event handling outside the ISR
+* Software debounce
+* Task-to-task event forwarding
+
+This keeps time-consuming processing outside interrupt context.
+
+---
+
+## Telemetry Architecture
+
+Telemetry is represented internally using structured C data.
+
+```c
+typedef struct
+{
+    sensor_data_t dados;
+    system_state_t estado;
+    bool alarme_reconhecido;
+} telemetry_data_t;
+```
+
+The telemetry structure contains:
+
+* Temperature
+* Three-axis acceleration
+* ADC measurement
+* Equipment operating state
+* Alarm acknowledgement status
+
+Application data is kept separate from protocol-specific encoding.
+
+This allows the telemetry layer to support different communication interfaces without coupling sensor acquisition directly to the transport protocol.
+
+---
+
+## CAN / TWAI Communication
+
+The project implements a CAN telemetry protocol using the ESP32 **TWAI controller**.
+
+Telemetry is divided into dedicated CAN frames.
+
+| CAN ID  | Data                             |
+| ------- | -------------------------------- |
+| `0x100` | Operating state and alarm status |
+| `0x200` | Temperature                      |
+| `0x201` | ADC measurement                  |
+| `0x202` | X/Y/Z acceleration               |
+
+Standard 11-bit CAN identifiers are used.
+
+### CAN Data Encoding
+
+Floating-point measurements are converted into fixed-point integer representations before transmission.
+
+Temperature:
+
+```text
+temperature × 100
+```
 
 Example:
 
 ```text
-TEMP=31.20
-AX=0.04
-AY=-0.01
-AZ=1.00
-ADC=2740
-STATE=WARNING
-ALARM_ACK=0
+24.00 °C
+→ 2400
+→ 0x0960
 ```
 
-The architecture keeps sensor acquisition independent from communication, allowing the telemetry transport layer to evolve without directly affecting the acquisition logic.
-
-Future telemetry versions will include:
-
-- Device identification
-- Message sequence counter
-- Timestamp
-- Heartbeat
-- Communication timeout detection
-- Message integrity validation
-- Communication fault recovery
-
----
-
-## In Development
-
-### CAN / TWAI
-
-The project is being expanded to support communication between embedded nodes using the ESP32 native **TWAI controller (CAN protocol)**.
-
-Planned functionality includes:
-
-- CAN/TWAI communication between ESP32 nodes
-- Message identifiers
-- Sensor telemetry frames
-- Equipment status frames
-- Alarm and diagnostic frames
-- Node identification
-- Communication timeout detection
-- Communication fault handling
-- Recovery after communication loss
-
----
-
-### RS-485
-
-An **RS-485 industrial communication layer** is also planned for communication between embedded devices and gateway systems.
-
-Development scope includes:
-
-- UART integration with RS-485 transceiver
-- Half-duplex communication
-- Device addressing
-- Structured message protocol
-- Command and telemetry exchange
-- Communication timeout detection
-- Fault recovery
-- Future evaluation of Modbus RTU
-
----
-
-### Firmware Robustness
-
-The firmware is being progressively expanded with reliability and diagnostic features:
-
-- Watchdog integration
-- NVS configuration persistence
-- Structured diagnostic logging using `ESP_LOG`
-- Centralized error handling
-- Automatic failure recovery
-- Communication health monitoring
-- Sensor failure detection
-- Modular `.c/.h` architecture
-- Integration tests
-- Fault injection tests
-
----
-
-## Embedded Linux Gateway
-
-The next system layer consists of an **embedded Linux gateway** responsible for receiving telemetry from embedded nodes and forwarding data to external services.
+Acceleration:
 
 ```text
-ESP32 Sensor Node
-       |
- CAN / RS-485
-       |
-       v
-Embedded Linux Gateway
-       |
-       +---- MQTT
-       |
-       +---- HTTP / REST
-       |
-       +---- TCP/IP
-       |
-       +---- UDP
-       |
-       v
-Backend / Cloud Services
+acceleration × 1000
 ```
 
-The gateway development roadmap includes:
+Example:
 
-- Modern C++
-- Linux services and daemons
-- Threads
-- Mutexes
-- Condition variables
-- Resource management
-- Error handling
-- IPC mechanisms
-- TCP/IP sockets
-- UDP communication
-- MQTT
-- HTTP/REST
-- External API integration
-- Network reconnection
-- Communication failure handling
-- `systemd` services
-- `systemd` timers
-- journal logging
+```text
+-0.250 g
+→ -250
+→ 0xFF06
+```
+
+Multi-byte values are serialized with the most significant byte first.
+
+The receiver reconstructs the original signed value and restores the engineering scale.
+
+### CAN Frame Validation
+
+The receive-side parser validates:
+
+* CAN identifier
+* Standard/extended frame format
+* RTR configuration
+* Data Length Code
+* Acquisition status
+* Operating state range
+* Alarm acknowledgement range
+
+Unexpected frames are rejected before their payload is interpreted.
+
+### CAN Execution Modes
+
+The firmware supports two CAN execution paths.
+
+#### Protocol Test Mode
+
+```c
+CAN_MODO_TESTE = 1
+```
+
+Frames are encoded, printed and processed locally.
+
+This validates:
+
+* Message layout
+* Payload encoding
+* Signed values
+* Scaling
+* Frame interpretation
+
+#### TWAI Driver Mode
+
+```c
+CAN_MODO_TESTE = 0
+```
+
+The ESP32 TWAI driver is configured for:
+
+```text
+500 kbit/s
+```
+
+Transmission uses:
+
+```c
+twai_transmit()
+```
+
+Reception is handled by a dedicated task using:
+
+```c
+twai_receive()
+```
+
+Received frames are forwarded to the same CAN protocol parser used by the protocol test mode.
 
 ---
 
-## Hardware Validation Roadmap
+## UART Communication
 
-The project is also being evolved from simulation toward physical prototyping and hardware validation.
+The firmware uses multiple ESP32 UART controllers.
 
-Planned activities include:
+UART communication is separated from sensor acquisition and control logic.
 
-- Datasheet analysis
-- Schematic reading
-- Physical prototyping
-- Power supply validation
-- Multimeter measurements
-- Oscilloscope analysis
-- Logic analyzer debugging
-- UART signal validation
-- I2C signal validation
-- PWM signal validation
-- Hardware fault diagnosis
-- Bring-up procedures
-- Through-hole soldering
-- SMD soldering practice
-- PCB schematic capture
-- PCB layout using **KiCad**
+UART1 can operate as the direct telemetry interface or as the Modbus Master interface when the Modbus loopback configuration is enabled.
+
+UART2 is used by the Modbus RTU Slave.
 
 ---
 
-## Reliability and Testing
+## Modbus RTU
 
-The project roadmap includes engineering practices focused on robustness and validation:
+Modbus RTU communication is implemented using the **ESP-Modbus** component.
 
-- Sensor failure simulation
-- Communication failure simulation
-- Timeout testing
-- Fault reproduction
-- Recovery testing
-- Boundary-value testing
-- Integration testing
-- Watchdog validation
-- Communication reconnection testing
-- Technical test documentation
-- Test result documentation
-- Non-conformity recording
+The firmware contains:
+
+* Modbus RTU Slave
+* Modbus RTU Master
+* Input Register mapping
+* Master parameter descriptor
+* Modbus request/response processing
+
+The Slave exposes an **Input Register** through the Modbus register area.
+
+The Master performs a standard Modbus request using function code:
+
+```text
+0x04 — Read Input Registers
+```
+
+Communication parameters:
+
+```text
+Mode:       Modbus RTU
+Baud rate:  115200
+Data bits:  8
+Parity:     None
+Stop bits:  1
+Slave ID:   1
+```
+
+### Modbus Architecture
+
+```text
+Modbus Master
+   UART1
+     |
+     v
+ Modbus RTU
+     |
+     v
+   UART2
+Modbus Slave
+     |
+     v
+Input Register
+```
+
+The firmware includes a configurable loopback mode:
+
+```c
+MODBUS_LOOPBACK_TEST
+```
+
+When enabled, UART1 operates as the Modbus Master and UART2 operates as the Modbus Slave.
+
+This configuration allows a complete Modbus request/response transaction to execute inside the project.
+
+### ESP-Modbus Integration
+
+The implementation uses ESP-Modbus controller APIs for:
+
+* Serial Slave creation
+* Serial Master creation
+* Communication configuration
+* Slave register descriptor configuration
+* Master parameter descriptor configuration
+* Slave startup
+* Master startup
+* Modbus request transmission
+* Input Register reading
+
+The implemented communication flow performs a Master request and receives the Input Register exposed by the Slave.
 
 ---
 
-## Technologies
+## Project Structure
 
-### Firmware
+The repository follows the standard ESP-IDF project structure.
 
-- C
-- C++
-- ESP32
-- ESP-IDF
-- FreeRTOS
+```text
+embedded-condition-monitor/
+|
+├── CMakeLists.txt
+├── dependencies.lock
+├── diagram.json
+├── wokwi.toml
+├── wokwi-project.txt
+|
+└── main/
+    ├── CMakeLists.txt
+    ├── idf_component.yml
+    └── main.c
+```
 
-### Microcontroller Peripherals
+The project uses CMake through the native ESP-IDF build system.
 
-- GPIO
-- ADC
-- PWM / LEDC
-- Interrupts
-- I2C
-- UART
-- Timers
+External component dependencies are managed through the ESP-IDF Component Manager.
 
-### RTOS Concepts
+---
 
-- Tasks
-- Queues
-- Task Notifications
-- Interrupt Service Routines
-- Blocking synchronization
-- Inter-task communication
+## Implementation Status
 
-### Industrial Communication
-
-- UART
-- CAN / TWAI
-- RS-485
-- Modbus RTU - planned
-
-### Network and Telemetry Roadmap
-
-- MQTT
-- HTTP/REST
-- TCP/IP
-- UDP
-- External APIs
-
-### Embedded Linux Roadmap
-
-- Modern C++
-- Threads
-- Mutexes
-- Condition Variables
-- IPC
-- Sockets
-- systemd
-- journal
-
-### Hardware
-
-- Sensors
-- Analog acquisition
-- Digital interfaces
-- Schematic reading
-- Datasheet analysis
-- Hardware debugging
-- PCB design
-- Prototyping
-
-### Tools
-
-- Git
-- GitHub
-- ESP-IDF
-- Wokwi
-- CMake
-- KiCad
-- Oscilloscope
-- Logic Analyzer
-- Multimeter
+* [x] ESP32 firmware using native ESP-IDF APIs
+* [x] MPU6050 integration via I2C
+* [x] ADC acquisition and sample averaging
+* [x] FreeRTOS multitask architecture
+* [x] Queue-based sensor and telemetry pipeline
+* [x] GPIO interrupts and Task Notifications
+* [x] NORMAL / WARNING / CRITICAL state machine
+* [x] LED and PWM buzzer alarm system
+* [x] Structured telemetry architecture
+* [x] UART communication
+* [x] CAN/TWAI telemetry protocol
+* [x] CAN frame encoding, decoding and validation
+* [x] Modbus RTU Master and Slave
+* [x] ESP-Modbus integration and register communication
 
 ---
 
 ## Development Approach
 
-The project is developed incrementally, with each subsystem implemented, tested and versioned separately.
+The project is developed incrementally using native ESP-IDF APIs, with emphasis on real-time architecture, clear separation of responsibilities, structured communication, error handling and maintainable firmware design.
 
-The development process emphasizes:
-
-- Native ESP-IDF APIs
-- Hardware/firmware integration
-- Clear separation of responsibilities
-- Real-time architecture
-- Failure handling
-- Code organization
-- Technical documentation
-- Testability
-- Reliability
-- Maintainability
-- Progressive system integration
-
-The goal is not only to implement functionality, but also to understand the complete behavior of the system from the hardware interface to the firmware architecture and external communication layers.
-
----
-
-## Development Roadmap
-
-### Current
-
-- [x] MPU6050 I2C integration
-- [x] Temperature acquisition
-- [x] Accelerometer acquisition
-- [x] ADC acquisition
-- [x] ADC averaging
-- [x] FreeRTOS sensor task
-- [x] FreeRTOS control task
-- [x] FreeRTOS Queue communication
-- [x] NORMAL / WARNING / CRITICAL state machine
-- [x] GPIO status LEDs
-- [x] GPIO interrupt
-- [x] Button debounce
-- [x] Task Notifications
-- [x] Alarm acknowledgement
-- [x] PWM buzzer
-- [x] UART configuration
-- [x] UART telemetry
-- [x] CAN/TWAI communication
-
-### Next Steps
-
-- [ ] RS-485 communication
-- [ ] Structured communication protocol
-- [ ] Heartbeat and timeout detection
-- [ ] Firmware modularization
-- [ ] Watchdog
-- [ ] NVS persistence
-- [ ] Structured diagnostic logging
-- [ ] Integration tests
-- [ ] Fault injection tests
-- [ ] Embedded Linux gateway
-- [ ] C++ Linux service
-- [ ] MQTT integration
-- [ ] HTTP/REST integration
-- [ ] TCP/IP and UDP communication
-- [ ] Hardware prototype
-- [ ] Oscilloscope and logic analyzer validation
-- [ ] KiCad schematic
-- [ ] PCB layout
-- [ ] OTA update
-
----
-
-## Project Status
-
-**Active Development**
-
-Current development priorities:
-
-1. CAN/TWAI communication
-2. RS-485 communication
-3. Firmware modularization
-4. Fault handling and watchdog
-5. NVS and diagnostic logging
-6. Embedded Linux gateway
-7. MQTT and HTTP integration
-8. Hardware validation
-9. KiCad PCB development
+Each subsystem is implemented and validated before being integrated into the complete monitoring platform.
 
 ---
 
@@ -502,6 +572,6 @@ Current development priorities:
 
 Computer Engineer
 
-Embedded Systems, Hardware & Firmware Development
+Embedded Systems | Hardware | Firmware
 
 Araçatuba, SP - Brazil
