@@ -874,6 +874,13 @@ void taskTelemetria(void *pvParameters){
     {
 
     enviar_telemetria_can(&telemetria);
+
+        printf(
+              "[DATA] TEMP=%.2f C ADC=%d STATE=%d\n",
+              telemetria.dados.temperatura_c,
+              telemetria.dados.valor_adc,
+              telemetria.estado
+          );
     
     esp_err_t resultado = mbc_slave_lock(slave_handle);
 
@@ -884,6 +891,7 @@ void taskTelemetria(void *pvParameters){
           modbus_input_regs[MB_INPUT_STATE] = (uint16_t)telemetria.estado;
           
         mbc_slave_unlock(slave_handle);
+
       }
 
 #if !MODBUS_LOOPBACK_TEST
@@ -955,36 +963,37 @@ static void IRAM_ATTR botao_isr(void *arg)
       };
 
       uint16_t regs_recebidos[MB_INPUT_COUNT] = {0};
-      
-      esp_err_t resultado = mbc_master_send_request(
-        master_handle,
-        &request,
-        regs_recebidos
-      );
-            
-      if (resultado == ESP_OK)
-      {
 
-      uint16_t adc = regs_recebidos[MB_INPUT_ADC];
-      uint16_t estado = regs_recebidos[MB_INPUT_STATE];
-      int16_t temperatura_x100 = (int16_t)regs_recebidos[MB_INPUT_TEMP];
-      float temperatura = temperatura_x100 / 100.0f;
+      while(true){
+      
+        esp_err_t resultado = mbc_master_send_request(
+          master_handle,
+          &request,
+          regs_recebidos
+        );
+              
+        if (resultado == ESP_OK)
+        {
+
+        uint16_t adc = regs_recebidos[MB_INPUT_ADC];
+        uint16_t estado = regs_recebidos[MB_INPUT_STATE];
+        int16_t temperatura_x100 = (int16_t)regs_recebidos[MB_INPUT_TEMP];
+        float temperatura = temperatura_x100 / 100.0f;
 
         printf("MODBUS MASTER: ADC: %d TEMPE: %.2f ESTADO: %d\n", adc, temperatura, estado);
 
+        }
+        else
+        {
+            printf(
+              "MODBUS MASTER erro: %s\n", esp_err_to_name(resultado)
+            );
+        }
+      
+      vTaskDelay(pdMS_TO_TICKS(1000));
       }
-      else
-      {
-          printf(
-            "MODBUS MASTER erro: %s\n",
-            esp_err_to_name(resultado)
-          );
-      }
-
-      vTaskDelete(NULL);
   }
 #endif
-
 
 void app_main(){
     mb_communication_info_t slave_config = {
