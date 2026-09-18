@@ -3,3 +3,4 @@ managed_components/
 .vscode/
 .clangd
 sdkconfig
+sdkconfig.old
