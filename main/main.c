@@ -158,6 +158,7 @@
 #include <mbcontroller.h>
 #include "esp_modbus_master.h"
 #include "esp_modbus_slave.h"
+#include "esp_task_wdt.h"
 
 #define I2C_PORT I2C_NUM_0
 #define I2C_SDA 21
@@ -348,11 +349,13 @@ esp_err_t mpu6050_init(i2c_master_dev_handle_t dev_handle)
 
 void taskSensores(void *pvParameters)
 {
+  ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
 
   sensor_task_context_t *ctx = (sensor_task_context_t *)pvParameters;
 
   while (true)
   {
+    ESP_ERROR_CHECK(esp_task_wdt_reset());
 
     sensor_data_t leitura = {0};
 
@@ -421,8 +424,9 @@ void taskSensores(void *pvParameters)
         ctx->fila, // Onde enviar (Handle da Fila)
         &leitura,  // O que enviar (Ponteiro para o Dado)
         pdMS_TO_TICKS(100));
-
+    
     vTaskDelay(pdMS_TO_TICKS(1000));
+        
   }
 }
 
@@ -873,39 +877,38 @@ void taskTelemetria(void *pvParameters){
     if (recebeu == pdTRUE)
     {
 
-    enviar_telemetria_can(&telemetria);
+      enviar_telemetria_can(&telemetria);
 
-        printf(
-              "[DATA] TEMP=%.2f C ADC=%d STATE=%d\n",
-              telemetria.dados.temperatura_c,
-              telemetria.dados.valor_adc,
-              telemetria.estado
-          );
-    
-    esp_err_t resultado = mbc_slave_lock(slave_handle);
-
-      if (resultado == ESP_OK){
+          printf(
+                "[DATA] TEMP=%.2f C ADC=%d STATE=%d\n",
+                telemetria.dados.temperatura_c,
+                telemetria.dados.valor_adc,
+                telemetria.estado
+            );
       
-          modbus_input_regs[MB_INPUT_ADC] = (uint16_t)telemetria.dados.valor_adc;
-          modbus_input_regs[MB_INPUT_TEMP] = (uint16_t)(int16_t)lroundf(telemetria.dados.temperatura_c * 100.0f);
-          modbus_input_regs[MB_INPUT_STATE] = (uint16_t)telemetria.estado;
-          
-        mbc_slave_unlock(slave_handle);
+      esp_err_t resultado = mbc_slave_lock(slave_handle);
 
-      }
+        if (resultado == ESP_OK){
+        
+            modbus_input_regs[MB_INPUT_ADC] = (uint16_t)telemetria.dados.valor_adc;
+            modbus_input_regs[MB_INPUT_TEMP] = (uint16_t)(int16_t)lroundf(telemetria.dados.temperatura_c * 100.0f);
+            modbus_input_regs[MB_INPUT_STATE] = (uint16_t)telemetria.estado;
+            
+          mbc_slave_unlock(slave_handle);
 
-#if !MODBUS_LOOPBACK_TEST
-      
-    uart_write_bytes(
-          UART1_PORT,
-          &telemetria,
-          sizeof(telemetria)
-    );
+        }
 
-#endif
+      #if !MODBUS_LOOPBACK_TEST
+            
+            uart_write_bytes(
+                  UART1_PORT,
+                  &telemetria,
+                  sizeof(telemetria)
+            );
+
+      #endif
 
     }
-    vTaskDelay(pdMS_TO_TICKS(500));
   }
 
 }
@@ -1368,4 +1371,5 @@ void app_main(){
       BOTAO,
       botao_isr,
       NULL));
+
 }
