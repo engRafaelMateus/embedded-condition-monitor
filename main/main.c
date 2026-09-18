@@ -159,6 +159,8 @@
 #include "esp_modbus_master.h"
 #include "esp_modbus_slave.h"
 #include "esp_task_wdt.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 
 #define I2C_PORT I2C_NUM_0
 #define I2C_SDA 21
@@ -188,7 +190,7 @@
 #define MB_RX 33
 #define MB_DEV_SPEED 115200
 #define MB_SLAVE_ADDR 1
-#define MB_REG_INPUT_START            (0)
+#define MB_REG_INPUT_START (0)
 
 static void *slave_handle = NULL;
 #define MODBUS_LOOPBACK_TEST 1
@@ -234,9 +236,26 @@ typedef enum
 
 typedef struct
 {
+  int16_t temp_warning;
+  int16_t temp_critical;
+  uint16_t adc_warning;
+  uint16_t adc_critical;
+  uint8_t device_id;
+} system_config_t;
+
+typedef struct
+{
   QueueHandle_t fila_sensores;
   QueueHandle_t fila_telemetria;
+  system_config_t *config;
 } control_task_context_t;
+
+static system_config_t system_config = {
+    .temp_warning = 45,
+    .temp_critical = 60,
+    .adc_warning = 2500,
+    .adc_critical = 3300,
+    .device_id = 1};
 
 typedef struct
 {
@@ -254,6 +273,32 @@ enum
 };
 
 static uint16_t modbus_input_regs[MB_INPUT_COUNT] = {0};
+
+enum
+{
+  MB_HOLD_TEMP_WARN = 0,
+  MB_HOLD_TEMP_CRIT,
+  MB_HOLD_ADC_WARN,
+  MB_HOLD_ADC_CRIT,
+  MB_HOLD_DEVICE_ID,
+  MB_HOLD_SAVE_CONFIG,
+  MB_HOLD_COUNT
+};
+
+static uint16_t modbus_holding_regs[MB_HOLD_COUNT] = {0};
+
+#define MODBUS_FUNC_WRITE_SINGLE_REGISTER 0x06
+#define MODBUS_FUNC_WRITE_MULTIPLE_REGISTERS 0x10
+
+/* NVS / configuracao */
+esp_err_t carregar_config_nvs(system_config_t *config);
+esp_err_t salvar_config_nvs(const system_config_t *config);
+esp_err_t atualizar_config_modbus(system_config_t *config);
+
+#if MODBUS_LOOPBACK_TEST
+esp_err_t modbus_master_escrever_holding(uint16_t reg_start, const uint16_t *valores, uint16_t quantidade);
+esp_err_t modbus_master_aplicar_config(const system_config_t *config, bool salvar);
+#endif
 
 esp_err_t ler_temperatura_raw(
     i2c_master_dev_handle_t dev_handle,
@@ -279,7 +324,8 @@ esp_err_t ler_temperatura_raw(
   return resultado;
 }
 
-esp_err_t ler_aceleracao_raw(i2c_master_dev_handle_t dev_handle, int16_t *ax,
+esp_err_t ler_aceleracao_raw(i2c_master_dev_handle_t dev_handle,
+                             int16_t *ax,
                              int16_t *ay,
                              int16_t *az)
 {
@@ -314,15 +360,15 @@ esp_err_t ler_aceleracao_raw(i2c_master_dev_handle_t dev_handle, int16_t *ax,
   2500 até 3299   → WARNING
   3300 ou mais    → CRITICAL
 */
-system_state_t avaliar_estado(sensor_data_t *dados)
+system_state_t avaliar_estado(const sensor_data_t *dados, const system_config_t *system_config)
 {
 
-  if (dados->valor_adc >= 3300 || dados->temperatura_c >= 60)
+  if (dados->valor_adc >= system_config->adc_critical || dados->temperatura_c >= system_config->temp_critical)
   {
 
     return STATE_CRITICAL;
   }
-  else if (dados->valor_adc >= 2500 || dados->temperatura_c >= 45)
+  else if (dados->valor_adc >= system_config->adc_warning || dados->temperatura_c >= system_config->temp_warning)
   {
 
     return STATE_WARNING;
@@ -424,9 +470,8 @@ void taskSensores(void *pvParameters)
         ctx->fila, // Onde enviar (Handle da Fila)
         &leitura,  // O que enviar (Ponteiro para o Dado)
         pdMS_TO_TICKS(100));
-    
+
     vTaskDelay(pdMS_TO_TICKS(1000));
-        
   }
 }
 
@@ -477,7 +522,18 @@ void taskControle(void *pvParameters)
 
     telemetria.dados = leitura;
 
-    system_state_t estado = avaliar_estado(&leitura);
+    esp_err_t config_resultado =
+        atualizar_config_modbus(ctx->config);
+
+    if (config_resultado != ESP_OK &&
+        config_resultado != ESP_ERR_INVALID_ARG)
+    {
+      printf(
+          "[CONFIG] Erro: %s\n",
+          esp_err_to_name(config_resultado));
+    }
+
+    system_state_t estado = avaliar_estado(&leitura, ctx->config);
 
     telemetria.estado = estado;
 
@@ -528,29 +584,6 @@ void taskControle(void *pvParameters)
           LEDC_LOW_SPEED_MODE,
           LEDC_CHANNEL_0);
     }
-
-    /*if (estado == STATE_NORMAL)
-    {
-      printf("Estado: NORMAL\n");
-    }
-    else if (estado == STATE_WARNING)
-    {
-      printf("Estado: WARNING\n");
-    }
-    else if (estado == STATE_CRITICAL)
-    {
-
-      printf("Estado: CRITICAL\n");
-
-      if (alarme_reconhecido)
-      {
-        printf("Alarme: RECONHECIDO\n");
-      }
-      else
-      {
-        printf("Alarme: NAO RECONHECIDO\n");
-      }
-    }*/
   }
 }
 
@@ -623,7 +656,7 @@ void processar_frame_can(const twai_message_t *message)
     if (message->data[2] != 0)
     {
       printf("Temperatura indisponivel: status de aquisicao %u\n",
-                                (unsigned int)message->data[2]);
+             (unsigned int)message->data[2]);
       return;
     }
 
@@ -634,7 +667,6 @@ void processar_frame_can(const twai_message_t *message)
     {
       temperatura_recebida_x100 -= 65536;
     }
-
   }
   else if (message->identifier == 0x201 &&
            message->extd == 0 &&
@@ -646,7 +678,6 @@ void processar_frame_can(const twai_message_t *message)
       printf("Leitura indisponivel: status de aquisicao %u\n", (uint16_t)message->data[2]);
       return;
     }
-
   }
   else if (message->identifier == 0x202 &&
            message->extd == 0 &&
@@ -683,7 +714,6 @@ void processar_frame_can(const twai_message_t *message)
     {
       az_g_x1000 -= 65536;
     }
-
   }
   else if (message->identifier == 0x100 &&
            message->extd == 0 &&
@@ -702,7 +732,6 @@ void processar_frame_can(const twai_message_t *message)
       printf("Mensagem rejeitada: estado ou reconhecimento invalido\n");
       return;
     }
-
   }
   else
   {
@@ -829,7 +858,8 @@ void enviar_telemetria_can(const telemetry_data_t *telemetria)
 #if !CAN_MODO_TESTE
 
 // Recebe frames do driver TWAI e entrega ao interpretador do protocolo.
-  void taskReceberCAN(void *pvParameters){
+void taskReceberCAN(void *pvParameters)
+{
 
   (void)pvParameters;
 
@@ -860,7 +890,8 @@ void enviar_telemetria_can(const telemetry_data_t *telemetria)
 
 #endif
 
-void taskTelemetria(void *pvParameters){
+void taskTelemetria(void *pvParameters)
+{
 
   QueueHandle_t fila_telemetria = (QueueHandle_t)pvParameters;
 
@@ -879,41 +910,38 @@ void taskTelemetria(void *pvParameters){
 
       enviar_telemetria_can(&telemetria);
 
-          printf(
-                "[DATA] TEMP=%.2f C ADC=%d STATE=%d\n",
-                telemetria.dados.temperatura_c,
-                telemetria.dados.valor_adc,
-                telemetria.estado
-            );
-      
+      printf(
+          "[DATA] TEMP=%.2f C ADC=%d STATE=%d\n",
+          telemetria.dados.temperatura_c,
+          telemetria.dados.valor_adc,
+          telemetria.estado);
+
       esp_err_t resultado = mbc_slave_lock(slave_handle);
 
-        if (resultado == ESP_OK){
-        
-            modbus_input_regs[MB_INPUT_ADC] = (uint16_t)telemetria.dados.valor_adc;
-            modbus_input_regs[MB_INPUT_TEMP] = (uint16_t)(int16_t)lroundf(telemetria.dados.temperatura_c * 100.0f);
-            modbus_input_regs[MB_INPUT_STATE] = (uint16_t)telemetria.estado;
-            
-          mbc_slave_unlock(slave_handle);
+      if (resultado == ESP_OK)
+      {
 
-        }
+        modbus_input_regs[MB_INPUT_ADC] = (uint16_t)telemetria.dados.valor_adc;
+        modbus_input_regs[MB_INPUT_TEMP] = (uint16_t)(int16_t)lroundf(telemetria.dados.temperatura_c * 100.0f);
+        modbus_input_regs[MB_INPUT_STATE] = (uint16_t)telemetria.estado;
 
-      #if !MODBUS_LOOPBACK_TEST
-            
-            uart_write_bytes(
-                  UART1_PORT,
-                  &telemetria,
-                  sizeof(telemetria)
-            );
+        mbc_slave_unlock(slave_handle);
+      }
 
-      #endif
+#if !MODBUS_LOOPBACK_TEST
 
+      uart_write_bytes(
+          UART1_PORT,
+          &telemetria,
+          sizeof(telemetria));
+
+#endif
     }
   }
-
 }
 
-void taskBotao(void *pvParameters){
+void taskBotao(void *pvParameters)
+{
 
   while (true)
   {
@@ -954,196 +982,454 @@ static void IRAM_ATTR botao_isr(void *arg)
 
 #if MODBUS_LOOPBACK_TEST
 
-  void taskModbusMaster(void *pvParameters){
+void taskModbusMaster(void *pvParameters)
+{
 
-      vTaskDelay(pdMS_TO_TICKS(1000));
+  vTaskDelay(pdMS_TO_TICKS(1000));
 
-      mb_param_request_t request = {
-          .slave_addr = MB_SLAVE_ADDR,
-          .command = MODBUS_FUNC_READ_INPUT_REGISTERS,
-          .reg_start = MB_REG_INPUT_START,
-          .reg_size = MB_INPUT_COUNT
-      };
+  mb_param_request_t request = {
+      .slave_addr = MB_SLAVE_ADDR,
+      .command = MODBUS_FUNC_READ_INPUT_REGISTERS,
+      .reg_start = MB_REG_INPUT_START,
+      .reg_size = MB_INPUT_COUNT};
 
-      uint16_t regs_recebidos[MB_INPUT_COUNT] = {0};
+  uint16_t regs_recebidos[MB_INPUT_COUNT] = {0};
 
-      while(true){
-      
-        esp_err_t resultado = mbc_master_send_request(
-          master_handle,
-          &request,
-          regs_recebidos
-        );
-              
-        if (resultado == ESP_OK)
-        {
+  while (true)
+  {
 
-        uint16_t adc = regs_recebidos[MB_INPUT_ADC];
-        uint16_t estado = regs_recebidos[MB_INPUT_STATE];
-        int16_t temperatura_x100 = (int16_t)regs_recebidos[MB_INPUT_TEMP];
-        float temperatura = temperatura_x100 / 100.0f;
+    esp_err_t resultado = mbc_master_send_request(
+        master_handle,
+        &request,
+        regs_recebidos);
 
-        printf("MODBUS MASTER: ADC: %d TEMPE: %.2f ESTADO: %d\n", adc, temperatura, estado);
+    if (resultado == ESP_OK)
+    {
 
-        }
-        else
-        {
-            printf(
-              "MODBUS MASTER erro: %s\n", esp_err_to_name(resultado)
-            );
-        }
-      
-      vTaskDelay(pdMS_TO_TICKS(1000));
-      }
+      uint16_t adc = regs_recebidos[MB_INPUT_ADC];
+      uint16_t estado = regs_recebidos[MB_INPUT_STATE];
+      int16_t temperatura_x100 = (int16_t)regs_recebidos[MB_INPUT_TEMP];
+      float temperatura = temperatura_x100 / 100.0f;
+
+      printf("MODBUS MASTER: ADC: %d TEMPE: %.2f ESTADO: %d\n", adc, temperatura, estado);
+    }
+    else
+    {
+      printf(
+          "MODBUS MASTER erro: %s\n", esp_err_to_name(resultado));
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1000));
   }
+}
 #endif
 
-void app_main(){
-    mb_communication_info_t slave_config = {
-        .ser_opts.port = MB_PORT_NUM,
-        .ser_opts.mode = MB_RTU,
-        .ser_opts.baudrate = MB_DEV_SPEED,
-        .ser_opts.parity = MB_PARITY_NONE,
-        .ser_opts.uid = MB_SLAVE_ADDR,
-        .ser_opts.data_bits = UART_DATA_8_BITS,
-        .ser_opts.stop_bits = UART_STOP_BITS_1
-    };
+esp_err_t carregar_config_nvs(system_config_t *config)
+{
+  nvs_handle_t nvs_handle;
 
-    ESP_ERROR_CHECK(
-        mbc_slave_create_serial(&slave_config, &slave_handle)
-    );
+  esp_err_t resultado = nvs_open(
+      "config",
+      NVS_READONLY,
+      &nvs_handle);
 
-      ESP_ERROR_CHECK(uart_set_pin(
-                                    MB_PORT_NUM,
-                                    MB_TX,
-                                    MB_RX,
-                                    UART_PIN_NO_CHANGE,
-                                    UART_PIN_NO_CHANGE
-                                  )
-      );
+  /* Primeira inicializacao: ainda nao existe configuracao salva.
+     Mantemos os valores default compilados em system_config. */
+  if (resultado == ESP_ERR_NVS_NOT_FOUND)
+  {
+    return ESP_OK;
+  }
 
-    mb_register_area_descriptor_t mb_slave_input_regs = {
-      .type = MB_PARAM_INPUT,
-      .start_offset = MB_REG_INPUT_START,
-      .address = modbus_input_regs,
-      .size = sizeof(modbus_input_regs)
-    };
+  if (resultado != ESP_OK)
+  {
+    return resultado;
+  }
 
-    ESP_ERROR_CHECK(
-      mbc_slave_set_descriptor(
-          slave_handle,
-          mb_slave_input_regs
-      )
-    );
+  resultado = nvs_get_i16(nvs_handle, "temp_warn", &config->temp_warning);
+  if (resultado != ESP_OK && resultado != ESP_ERR_NVS_NOT_FOUND)
+  {
+    nvs_close(nvs_handle);
+    return resultado;
+  }
 
-    ESP_ERROR_CHECK(
-      mbc_slave_start(slave_handle)
-    );
+  resultado = nvs_get_i16(nvs_handle, "temp_crit", &config->temp_critical);
+  if (resultado != ESP_OK && resultado != ESP_ERR_NVS_NOT_FOUND)
+  {
+    nvs_close(nvs_handle);
+    return resultado;
+  }
+
+  resultado = nvs_get_u16(nvs_handle, "adc_warn", &config->adc_warning);
+  if (resultado != ESP_OK && resultado != ESP_ERR_NVS_NOT_FOUND)
+  {
+    nvs_close(nvs_handle);
+    return resultado;
+  }
+
+  resultado = nvs_get_u16(nvs_handle, "adc_crit", &config->adc_critical);
+  if (resultado != ESP_OK && resultado != ESP_ERR_NVS_NOT_FOUND)
+  {
+    nvs_close(nvs_handle);
+    return resultado;
+  }
+
+  resultado = nvs_get_u8(nvs_handle, "device_id", &config->device_id);
+  if (resultado != ESP_OK && resultado != ESP_ERR_NVS_NOT_FOUND)
+  {
+    nvs_close(nvs_handle);
+    return resultado;
+  }
+
+  nvs_close(nvs_handle);
+  return ESP_OK;
+}
+
+esp_err_t salvar_config_nvs(const system_config_t *config)
+{
+  nvs_handle_t nvs_handle;
+
+  esp_err_t resultado = nvs_open(
+      "config",
+      NVS_READWRITE,
+      &nvs_handle);
+
+  if (resultado != ESP_OK)
+  {
+    return resultado;
+  }
+
+  resultado = nvs_set_i16(nvs_handle, "temp_warn", config->temp_warning);
+  if (resultado != ESP_OK)
+  {
+    nvs_close(nvs_handle);
+    return resultado;
+  }
+
+  resultado = nvs_set_i16(nvs_handle, "temp_crit", config->temp_critical);
+  if (resultado != ESP_OK)
+  {
+    nvs_close(nvs_handle);
+    return resultado;
+  }
+
+  resultado = nvs_set_u16(nvs_handle, "adc_warn", config->adc_warning);
+  if (resultado != ESP_OK)
+  {
+    nvs_close(nvs_handle);
+    return resultado;
+  }
+
+  resultado = nvs_set_u16(nvs_handle, "adc_crit", config->adc_critical);
+  if (resultado != ESP_OK)
+  {
+    nvs_close(nvs_handle);
+    return resultado;
+  }
+
+  resultado = nvs_set_u8(nvs_handle, "device_id", config->device_id);
+  if (resultado != ESP_OK)
+  {
+    nvs_close(nvs_handle);
+    return resultado;
+  }
+
+  resultado = nvs_commit(nvs_handle);
+
+  nvs_close(nvs_handle);
+  return resultado;
+}
+
+static bool config_valida(const system_config_t *config)
+{
+  return config->temp_warning < config->temp_critical &&
+         config->adc_warning < config->adc_critical &&
+         config->device_id >= 1 &&
+         config->device_id <= 247;
+}
+
+static void copiar_config_para_holding(const system_config_t *config)
+{
+  modbus_holding_regs[MB_HOLD_TEMP_WARN] = (uint16_t)config->temp_warning;
+  modbus_holding_regs[MB_HOLD_TEMP_CRIT] = (uint16_t)config->temp_critical;
+  modbus_holding_regs[MB_HOLD_ADC_WARN] = config->adc_warning;
+  modbus_holding_regs[MB_HOLD_ADC_CRIT] = config->adc_critical;
+  modbus_holding_regs[MB_HOLD_DEVICE_ID] = config->device_id;
+  modbus_holding_regs[MB_HOLD_SAVE_CONFIG] = 0;
+}
+
+esp_err_t atualizar_config_modbus(system_config_t *config)
+{
+  esp_err_t resultado = mbc_slave_lock(slave_handle);
+
+  if (resultado != ESP_OK)
+  {
+    return resultado;
+  }
+
+  uint16_t device_id_raw = modbus_holding_regs[MB_HOLD_DEVICE_ID];
+
+  system_config_t nova_config = {
+      .temp_warning = (int16_t)modbus_holding_regs[MB_HOLD_TEMP_WARN],
+      .temp_critical = (int16_t)modbus_holding_regs[MB_HOLD_TEMP_CRIT],
+      .adc_warning = modbus_holding_regs[MB_HOLD_ADC_WARN],
+      .adc_critical = modbus_holding_regs[MB_HOLD_ADC_CRIT],
+      .device_id = (uint8_t)device_id_raw};
+
+  bool salvar = (modbus_holding_regs[MB_HOLD_SAVE_CONFIG] == 1);
+
+  if (device_id_raw > UINT8_MAX || !config_valida(&nova_config))
+  {
+    copiar_config_para_holding(config);
+    mbc_slave_unlock(slave_handle);
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  /* Alteracoes feitas pelo Master passam a valer imediatamente em RAM. */
+  *config = nova_config;
+
+  /* SAVE_CONFIG funciona como comando momentaneo. */
+  modbus_holding_regs[MB_HOLD_SAVE_CONFIG] = 0;
+
+  mbc_slave_unlock(slave_handle);
+
+  if (!salvar)
+  {
+    return ESP_OK;
+  }
+
+  resultado = salvar_config_nvs(config);
+
+  if (resultado == ESP_OK)
+  {
+    printf(
+        "[NVS] Config salva: TEMP=%d/%d ADC=%u/%u ID=%u\n",
+        config->temp_warning,
+        config->temp_critical,
+        (unsigned int)config->adc_warning,
+        (unsigned int)config->adc_critical,
+        (unsigned int)config->device_id);
+  }
+
+  return resultado;
+}
 
 #if MODBUS_LOOPBACK_TEST
 
-      mb_communication_info_t master_config = {
-        .ser_opts.port = UART1_PORT,
-        .ser_opts.mode = MB_RTU,
-        .ser_opts.baudrate = MB_DEV_SPEED,
-        .ser_opts.parity = MB_PARITY_NONE,
-        .ser_opts.uid = 0,
-        .ser_opts.response_tout_ms = 1000,
-        .ser_opts.data_bits = UART_DATA_8_BITS,
-        .ser_opts.stop_bits = UART_STOP_BITS_1
-      };
+esp_err_t modbus_master_escrever_holding(
+      uint16_t reg_start,
+      const uint16_t *valores,
+      uint16_t quantidade)
+  {
+    if (valores == NULL || quantidade == 0)
+    {
+      return ESP_ERR_INVALID_ARG;
+    }
 
-      ESP_ERROR_CHECK(
-        mbc_master_create_serial(
-            &master_config,
-            &master_handle
-        )
-      );
+    mb_param_request_t request = {
+        .slave_addr = MB_SLAVE_ADDR,
+        .command = MODBUS_FUNC_WRITE_MULTIPLE_REGISTERS,
+        .reg_start = reg_start,
+        .reg_size = quantidade};
 
-      static const mb_parameter_descriptor_t master_descriptor[] = {
-        {
-          .cid = 0,
-          .param_key = "adc",
-          .param_units = "",
-          .mb_slave_addr = MB_SLAVE_ADDR,
-          .mb_param_type = MB_PARAM_INPUT,
-          .mb_reg_start = MB_INPUT_ADC,
-          .mb_size = 1,
-          .param_offset = 0,
-          .param_type = PARAM_TYPE_U16,
-          .param_size = 2,
-          .param_opts = { .opt1 = 0, .opt2 = 0, .opt3 = 0 },
-          .access = PAR_PERMS_READ
-        }
-      };  
+    return mbc_master_send_request(
+        master_handle,
+        &request,
+        (void *)valores);
+} 
 
-      ESP_ERROR_CHECK(
-        mbc_master_set_descriptor(
-            master_handle,
-            master_descriptor,
-            sizeof(master_descriptor) / sizeof(master_descriptor[0])
-        )
-      );
+esp_err_t modbus_master_aplicar_config(
+    const system_config_t *config,
+    bool salvar)
+{
+    if (config == NULL || !config_valida(config))
+    {
+      return ESP_ERR_INVALID_ARG;
+    }
 
-      ESP_ERROR_CHECK(uart_set_pin(
-        UART1_PORT,
-        UART1_TX,
-        UART1_RX,
-        UART_PIN_NO_CHANGE,
-        UART_PIN_NO_CHANGE)
-      );
+    uint16_t valores[5] = {
+        (uint16_t)config->temp_warning,
+        (uint16_t)config->temp_critical,
+        config->adc_warning,
+        config->adc_critical,
+        config->device_id};
 
-      ESP_ERROR_CHECK(
-        mbc_master_start(master_handle)
-      );
+    esp_err_t resultado = modbus_master_escrever_holding(
+        MB_HOLD_TEMP_WARN,
+        valores,
+        5);
 
-      xTaskCreate(
-        taskModbusMaster,
-        "taskModbusMaster",
-        4096,
-        NULL,
-        5,
-        NULL
-      );
+    if (resultado != ESP_OK || !salvar)
+    {
+      return resultado;
+    }
+
+    uint16_t comando_salvar = 1;
+
+    return modbus_master_escrever_holding(
+        MB_HOLD_SAVE_CONFIG,
+        &comando_salvar,
+        1);
+  }
+
+#endif
+
+void app_main()
+{
+
+  esp_err_t resultado = nvs_flash_init();
+
+  if (resultado == ESP_ERR_NVS_NO_FREE_PAGES ||
+      resultado == ESP_ERR_NVS_NEW_VERSION_FOUND)
+  {
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    resultado = nvs_flash_init();
+  }
+
+  ESP_ERROR_CHECK(resultado);
+  ESP_ERROR_CHECK(carregar_config_nvs(&system_config));
+
+  printf(
+      "[CONFIG] TEMP_WARN=%d TEMP_CRIT=%d ADC_WARN=%u ADC_CRIT=%u ID=%u\n",
+      system_config.temp_warning,
+      system_config.temp_critical,
+      (unsigned int)system_config.adc_warning,
+      (unsigned int)system_config.adc_critical,
+      (unsigned int)system_config.device_id);
+
+  copiar_config_para_holding(&system_config);
+
+  mb_communication_info_t slave_config = {
+      .ser_opts.port = MB_PORT_NUM,
+      .ser_opts.mode = MB_RTU,
+      .ser_opts.baudrate = MB_DEV_SPEED,
+      .ser_opts.parity = MB_PARITY_NONE,
+      .ser_opts.uid = MB_SLAVE_ADDR,
+      .ser_opts.data_bits = UART_DATA_8_BITS,
+      .ser_opts.stop_bits = UART_STOP_BITS_1};
+
+  ESP_ERROR_CHECK(
+      mbc_slave_create_serial(&slave_config, &slave_handle));
+
+  ESP_ERROR_CHECK(uart_set_pin(
+      MB_PORT_NUM,
+      MB_TX,
+      MB_RX,
+      UART_PIN_NO_CHANGE,
+      UART_PIN_NO_CHANGE));
+
+  mb_register_area_descriptor_t mb_slave_input_regs = {
+      .type = MB_PARAM_INPUT,
+      .start_offset = MB_REG_INPUT_START,
+      .address = modbus_input_regs,
+      .size = sizeof(modbus_input_regs),
+      .access = MB_ACCESS_RO};
+
+  mb_register_area_descriptor_t mb_slave_holding_regs = {
+      .type = MB_PARAM_HOLDING,
+      .start_offset = 0,
+      .address = modbus_holding_regs,
+      .size = sizeof(modbus_holding_regs),
+      .access = MB_ACCESS_RW};
+
+  ESP_ERROR_CHECK(
+      mbc_slave_set_descriptor(
+          slave_handle,
+          mb_slave_input_regs));
+
+  ESP_ERROR_CHECK(
+      mbc_slave_set_descriptor(
+          slave_handle,
+          mb_slave_holding_regs));
+
+  ESP_ERROR_CHECK(
+      mbc_slave_start(slave_handle));
+
+#if MODBUS_LOOPBACK_TEST
+
+  mb_communication_info_t master_config = {
+      .ser_opts.port = UART1_PORT,
+      .ser_opts.mode = MB_RTU,
+      .ser_opts.baudrate = MB_DEV_SPEED,
+      .ser_opts.parity = MB_PARITY_NONE,
+      .ser_opts.uid = 0,
+      .ser_opts.response_tout_ms = 1000,
+      .ser_opts.data_bits = UART_DATA_8_BITS,
+      .ser_opts.stop_bits = UART_STOP_BITS_1};
+
+  ESP_ERROR_CHECK(
+      mbc_master_create_serial(
+          &master_config,
+          &master_handle));
+
+  static const mb_parameter_descriptor_t master_descriptor[] = {
+      {.cid = 0,
+       .param_key = "adc",
+       .param_units = "",
+       .mb_slave_addr = MB_SLAVE_ADDR,
+       .mb_param_type = MB_PARAM_INPUT,
+       .mb_reg_start = MB_INPUT_ADC,
+       .mb_size = 1,
+       .param_offset = 0,
+       .param_type = PARAM_TYPE_U16,
+       .param_size = 2,
+       .param_opts = {.opt1 = 0, .opt2 = 0, .opt3 = 0},
+       .access = PAR_PERMS_READ}};
+
+  ESP_ERROR_CHECK(
+      mbc_master_set_descriptor(
+          master_handle,
+          master_descriptor,
+          sizeof(master_descriptor) / sizeof(master_descriptor[0])));
+
+  ESP_ERROR_CHECK(uart_set_pin(
+      UART1_PORT,
+      UART1_TX,
+      UART1_RX,
+      UART_PIN_NO_CHANGE,
+      UART_PIN_NO_CHANGE));
+
+  ESP_ERROR_CHECK(
+      mbc_master_start(master_handle));
+
+  xTaskCreate(
+      taskModbusMaster,
+      "taskModbusMaster",
+      4096,
+      NULL,
+      5,
+      NULL);
 
 #else
 
-    uart_config_t uart1_config = {
-        .baud_rate = 115200,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT
-    };
+  uart_config_t uart1_config = {
+      .baud_rate = 115200,
+      .data_bits = UART_DATA_8_BITS,
+      .parity = UART_PARITY_DISABLE,
+      .stop_bits = UART_STOP_BITS_1,
+      .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+      .source_clk = UART_SCLK_DEFAULT};
 
-    ESP_ERROR_CHECK(
-        uart_param_config(
-            UART1_PORT,
-            &uart1_config
-        )
-    );
+  ESP_ERROR_CHECK(
+      uart_param_config(
+          UART1_PORT,
+          &uart1_config));
 
-    ESP_ERROR_CHECK(
-        uart_set_pin(
-            UART1_PORT,
-            UART1_TX,
-            UART1_RX,
-            UART_PIN_NO_CHANGE,
-            UART_PIN_NO_CHANGE
-        )
-    );
+  ESP_ERROR_CHECK(
+      uart_set_pin(
+          UART1_PORT,
+          UART1_TX,
+          UART1_RX,
+          UART_PIN_NO_CHANGE,
+          UART_PIN_NO_CHANGE));
 
-    ESP_ERROR_CHECK(
-        uart_driver_install(
-            UART1_PORT,
-            256,
-            0,
-            0,
-            NULL,
-            0
-        )
-    );
+  ESP_ERROR_CHECK(
+      uart_driver_install(
+          UART1_PORT,
+          256,
+          0,
+          0,
+          NULL,
+          0));
 
 #endif
 
@@ -1185,7 +1471,7 @@ void app_main(){
 
   ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));
 
-  adc_oneshot_chan_cfg_t config = {
+  adc_oneshot_chan_cfg_t adc_config = {
       .bitwidth = ADC_BITWIDTH_DEFAULT,
       .atten = ADC_ATTEN_DB_12,
   };
@@ -1193,7 +1479,7 @@ void app_main(){
   ESP_ERROR_CHECK(adc_oneshot_config_channel(
       adc1_handle,
       ADC_CHANNEL_6,
-      &config));
+      &adc_config));
 
   QueueHandle_t fila_sensores;
 
@@ -1229,6 +1515,7 @@ void app_main(){
 
   control_ctx.fila_sensores = fila_sensores;
   control_ctx.fila_telemetria = fila_telemetria;
+  control_ctx.config = &system_config;
 
   gpio_config_t led_config = {
       .pin_bit_mask =
@@ -1282,7 +1569,6 @@ void app_main(){
     abort();
   }
 
-
 #if !CAN_MODO_TESTE
 
   twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(GPIO_NUM_17,
@@ -1293,7 +1579,7 @@ void app_main(){
 
   twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
-  esp_err_t resultado = twai_driver_install(&g_config, &t_config, &f_config);
+  resultado = twai_driver_install(&g_config, &t_config, &f_config);
 
   BaseType_t task_criada = xTaskCreate(
       taskReceberCAN,
@@ -1371,5 +1657,4 @@ void app_main(){
       BOTAO,
       botao_isr,
       NULL));
-
 }
