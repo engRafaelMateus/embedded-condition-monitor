@@ -366,7 +366,6 @@ void taskSensores(void *pvParameters)
     }
 
     leitura.temperatura_c = (leitura.temperatura_raw / 340.0f) + 36.53f;
-    printf("Temperatura Sensor: %.2f C\n", leitura.temperatura_c);
 
     resultado = ler_aceleracao_raw(
         ctx->mpu_handle,
@@ -385,10 +384,6 @@ void taskSensores(void *pvParameters)
     leitura.ax_g = leitura.ax / 16384.0f;
     leitura.ay_g = leitura.ay / 16384.0f;
     leitura.az_g = leitura.az / 16384.0f;
-
-    printf("AX: %.2f g\n", leitura.ax_g);
-    printf("AY: %.2f g\n", leitura.ay_g);
-    printf("AZ: %.2f g\n", leitura.az_g);
 
     int soma = 0;
     int leituras_validas = 0;
@@ -414,7 +409,6 @@ void taskSensores(void *pvParameters)
     if (leituras_validas == 10)
     {
       leitura.valor_adc = soma / 10;
-      printf("Valor ADC: %d\n", leitura.valor_adc);
     }
     else
     {
@@ -531,7 +525,7 @@ void taskControle(void *pvParameters)
           LEDC_CHANNEL_0);
     }
 
-    if (estado == STATE_NORMAL)
+    /*if (estado == STATE_NORMAL)
     {
       printf("Estado: NORMAL\n");
     }
@@ -552,7 +546,7 @@ void taskControle(void *pvParameters)
       {
         printf("Alarme: NAO RECONHECIDO\n");
       }
-    }
+    }*/
   }
 }
 
@@ -625,7 +619,7 @@ void processar_frame_can(const twai_message_t *message)
     if (message->data[2] != 0)
     {
       printf("Temperatura indisponivel: status de aquisicao %u\n",
-             (unsigned int)message->data[2]);
+                                (unsigned int)message->data[2]);
       return;
     }
 
@@ -637,8 +631,6 @@ void processar_frame_can(const twai_message_t *message)
       temperatura_recebida_x100 -= 65536;
     }
 
-    float conversao = temperatura_recebida_x100 / 100.0f;
-    printf("[TESTE CAN RX] Temperatura = %.2f C\n", conversao);
   }
   else if (message->identifier == 0x201 &&
            message->extd == 0 &&
@@ -647,13 +639,10 @@ void processar_frame_can(const twai_message_t *message)
   {
     if (message->data[2] != 0)
     {
-      printf("Leitura indisponivel: status de aquisicao %u\n",
-             (unsigned int)message->data[2]);
+      printf("Leitura indisponivel: status de aquisicao %u\n", (uint16_t)message->data[2]);
       return;
     }
 
-    uint16_t ADC = (message->data[0] * 256u) + message->data[1];
-    printf("[TESTE CAN RX] ADC = %d\n", ADC);
   }
   else if (message->identifier == 0x202 &&
            message->extd == 0 &&
@@ -675,8 +664,6 @@ void processar_frame_can(const twai_message_t *message)
       ax_g_x1000 -= 65536;
     }
 
-    float conversao_x = ax_g_x1000 / 1000.0f;
-
     bits = (message->data[2] * 256u) + message->data[3];
     int32_t ay_g_x1000 = bits;
 
@@ -684,8 +671,6 @@ void processar_frame_can(const twai_message_t *message)
     {
       ay_g_x1000 -= 65536;
     }
-
-    float conversao_y = ay_g_x1000 / 1000.0f;
 
     bits = (message->data[4] * 256u) + message->data[5];
     int32_t az_g_x1000 = bits;
@@ -695,9 +680,6 @@ void processar_frame_can(const twai_message_t *message)
       az_g_x1000 -= 65536;
     }
 
-    float conversao_z = az_g_x1000 / 1000.0f;
-
-    printf("[TESTE CAN RX]\nAcel_x = %.3f g\nAcel_y = %.3f g\nAcel_z = %.3f g\n", conversao_x, conversao_y, conversao_z);
   }
   else if (message->identifier == 0x100 &&
            message->extd == 0 &&
@@ -717,10 +699,6 @@ void processar_frame_can(const twai_message_t *message)
       return;
     }
 
-    uint8_t estado = message->data[0];
-    bool alarme_reconhecido = message->data[1];
-
-    printf("[TESTE CAN RX]\nSTATUS = %d\nALARME = %d\n", estado, alarme_reconhecido);
   }
   else
   {
@@ -739,14 +717,6 @@ void enviar_mensagem(const twai_message_t *message)
 
 #if CAN_MODO_TESTE
 
-  printf("[TESTE CAN TX] ID=0x%X DLC=%d DATA=", (unsigned int)message->identifier, message->data_length_code);
-
-  for (int i = 0; i < message->data_length_code; i++)
-  {
-    printf("%02X ", (unsigned int)message->data[i]);
-  }
-
-  printf("\n");
   processar_frame_can(message);
 
 #else
@@ -1000,10 +970,7 @@ static void IRAM_ATTR botao_isr(void *arg)
       int16_t temperatura_x100 = (int16_t)regs_recebidos[MB_INPUT_TEMP];
       float temperatura = temperatura_x100 / 100.0f;
 
-        printf("MODBUS MASTER recebeu:\n");        
-        printf("MODBUS ADC: %d\n", adc);
-        printf("MODBUS ESTADO: %d\n", estado);
-        printf("MODBUS TEMPERATURA: %.2f\n", temperatura);
+        printf("MODBUS MASTER: ADC: %d TEMPE: %.2f ESTADO: %d\n", adc, temperatura, estado);
 
       }
       else
@@ -1030,13 +997,9 @@ void app_main(){
         .ser_opts.stop_bits = UART_STOP_BITS_1
     };
 
-    printf("MODBUS: antes do create\n");
-
     ESP_ERROR_CHECK(
         mbc_slave_create_serial(&slave_config, &slave_handle)
     );
-
-    printf("MODBUS: create OK\n");
 
       ESP_ERROR_CHECK(uart_set_pin(
                                     MB_PORT_NUM,
@@ -1064,8 +1027,6 @@ void app_main(){
     ESP_ERROR_CHECK(
       mbc_slave_start(slave_handle)
     );
-
-    printf("MODBUS: start OK\n");
 
 #if MODBUS_LOOPBACK_TEST
 
@@ -1321,26 +1282,6 @@ void app_main(){
   twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
   esp_err_t resultado = twai_driver_install(&g_config, &t_config, &f_config);
-
-  if (resultado == ESP_OK)
-  {
-    printf("Driver installed\n");
-  }
-  else
-  {
-    printf("Failed to install driver\n");
-    return;
-  }
-
-  if (twai_start() == ESP_OK)
-  {
-    printf("Driver started\n");
-  }
-  else
-  {
-    printf("Failed to start driver\n");
-    return;
-  }
 
   BaseType_t task_criada = xTaskCreate(
       taskReceberCAN,
